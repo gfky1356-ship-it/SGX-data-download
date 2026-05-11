@@ -19,9 +19,14 @@
 # obv sell_ban is ON when OBV long SMA slope > 0
 # (volume accumulation trend is still rising — don't sell)
 #
+# Filters applied after data download:
+#   volume > 100,000  AND  price > 0.20
+#   Only stocks passing both filters proceed to scanning.
+#
 # Outputs:
-#   /content/sgx_scan_results.csv   full results for all stocks
-#   /content/sgx_watchlist.txt      TradingView watchlist (confirmed only)
+#   /content/sgx_scan_results.csv        full results for filtered stocks
+#   /content/sgx_watchlist.txt           TradingView watchlist (confirmed only)
+#   /content/fa_reports/<TICKER>_FA_...  HTML FA report per confirmed stock
 # ============================================================
 
 # ── Cell 1: Install ─────────────────────────────────────────
@@ -29,7 +34,7 @@
 
 
 # ── Cell 2: Run Scanner ──────────────────────────────────────
-import csv, time, warnings
+import csv, importlib.util, os, time, warnings
 import numpy as np
 import pandas as pd
 import requests
@@ -40,8 +45,13 @@ warnings.filterwarnings("ignore")
 
 OUTPUT_RESULTS   = "/content/sgx_scan_results.csv"
 OUTPUT_WATCHLIST = "/content/sgx_watchlist.txt"
+FA_REPORTS_DIR   = "/content/fa_reports"
 BATCH_SIZE       = 50
 BENCHMARK        = "^STI"
+
+# Volume and price thresholds for pre-scan filter
+MIN_VOLUME = 100_000
+MIN_PRICE  = 0.20
 
 
 # ════════════════════════════════════════════════════════════
@@ -220,7 +230,7 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
 print("=" * 55)
 print("  SGX STOCK SCANNER")
 print("=" * 55)
-print("\n[1/4] Fetching SGX stock list...")
+print("\n[1/5] Fetching SGX stock list...")
 
 resp = requests.get(
     "https://api.sgx.com/securities/v1.1/",
@@ -241,7 +251,7 @@ print(f"    Found {len(ticker_info)} stocks")
 # ════════════════════════════════════════════════════════════
 end_date   = datetime.today().strftime("%Y-%m-%d")
 start_date = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
-print(f"\n[2/4] Downloading data ({start_date} → {end_date})...")
+print(f"\n[2/5] Downloading data ({start_date} → {end_date})...")
 print(f"    Fetching benchmark {BENCHMARK}...")
 
 sti_raw   = yf.download(BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
@@ -276,9 +286,28 @@ print(f"    Total stocks with data: {len(stock_data)}")
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 3 — Run scanners, check last bar
+# STEP 2b — Filter: volume > 100,000 AND price > 0.20
+# Only qualified stocks proceed to scanning.
 # ════════════════════════════════════════════════════════════
-print(f"\n[3/4] Running scanners on {len(stock_data)} stocks...")
+print(f"\n[2b/5] Applying filters  (volume > {MIN_VOLUME:,}  AND  price > {MIN_PRICE})...")
+
+filtered_data = {}
+for t, df in stock_data.items():
+    last_vol   = float(df["volume"].iloc[-1])
+    last_close = float(df["close"].iloc[-1])
+    if last_vol > MIN_VOLUME and last_close > MIN_PRICE:
+        filtered_data[t] = df
+
+print(f"    Before filter : {len(stock_data)} stocks")
+print(f"    After  filter : {len(filtered_data)} stocks  "
+      f"({len(stock_data) - len(filtered_data)} removed)")
+stock_data = filtered_data
+
+
+# ════════════════════════════════════════════════════════════
+# STEP 3 — Run scanners on filtered tickers, check last bar
+# ════════════════════════════════════════════════════════════
+print(f"\n[3/5] Running scanners on {len(stock_data)} filtered stocks...")
 
 results  = []
 min_bars = 110   # OBV long SMA needs 100 bars minimum
@@ -315,17 +344,17 @@ for idx, (yf_t, df) in enumerate(stock_data.items()):
         pass
 
     if (idx + 1) % 50 == 0:
-        matched = sum(1 for r in results if r["signal_confirmed"])
-        print(f"    {idx+1}/{len(stock_data)} scanned | {matched} confirmed so far")
+        matched_so_far = sum(1 for r in results if r["signal_confirmed"])
+        print(f"    {idx+1}/{len(stock_data)} scanned | {matched_so_far} confirmed so far")
 
 matched = [r for r in results if r["signal_confirmed"]]
 print(f"\n    Scan complete: {len(results)} scanned, {len(matched)} confirmed signals")
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 4 — Export results
+# STEP 4 — Export scan results
 # ════════════════════════════════════════════════════════════
-print(f"\n[4/4] Exporting results...")
+print(f"\n[4/5] Exporting scan results...")
 
 fieldnames = ["symbol", "name", "market", "signal_confirmed",
               "sma_gap_buy", "breakout_buy", "obv_sell_ban",
@@ -356,5 +385,121 @@ if matched:
 else:
     print("  No confirmed signals today.")
 print("=" * 60)
-print("\nDone! Import into TradingView:")
+
+
+# ════════════════════════════════════════════════════════════
+# STEP 5 — FA Scan: run GlobalScreenerV59_CN on each
+#          confirmed stock and export an HTML report.
+#
+# Requires: "Glaude Global_FA_Scan_CN_5_9 .py" in the same
+#           directory as this script.
+# Fundamental data is fetched from Yahoo Finance (yfinance).
+# Fields unavailable from yfinance are marked [NO DATA] and
+# handled gracefully by the screener class.
+# ════════════════════════════════════════════════════════════
+print(f"\n[5/5] Running FA scan on {len(matched)} confirmed stocks...")
+
+_fa_filename = "Glaude Global_FA_Scan_CN_5_9 .py"
+_fa_path     = os.path.join(os.getcwd(), _fa_filename)
+
+if not matched:
+    print("    No confirmed signals — FA scan skipped.")
+elif not os.path.exists(_fa_path):
+    print(f"    WARNING: FA scan file not found at:\n      {_fa_path}")
+    print(f"    Ensure '{_fa_filename}' is in the same directory.")
+else:
+    # Dynamically load GlobalScreenerV59_CN from the FA scan file
+    _spec = importlib.util.spec_from_file_location("fa_scan", _fa_path)
+    _fa_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_fa_mod)
+    GlobalScreenerV59_CN = _fa_mod.GlobalScreenerV59_CN
+
+    os.makedirs(FA_REPORTS_DIR, exist_ok=True)
+
+    def _fetch_fa_data(yf_ticker, fallback_name):
+        """Fetch fundamental data from yfinance and map to screener fields."""
+        try:
+            info = yf.Ticker(yf_ticker).info
+        except Exception:
+            info = {}
+
+        def _pct(v):
+            return round(v * 100, 2) if v is not None else "[NO DATA]"
+
+        def _num(v, dp=2):
+            return round(v, dp) if v is not None else "[NO DATA]"
+
+        def _pe(v):
+            return round(v, 2) if v is not None else "—"
+
+        roe        = _pct(info.get("returnOnEquity"))
+        margin     = _pct(info.get("profitMargins"))
+        rev_cagr   = _pct(info.get("revenueGrowth"))
+        eps_raw    = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")
+        eps_growth = _pct(eps_raw)
+        de_raw     = info.get("debtToEquity")
+        debt_eq    = round(de_raw / 100, 2) if de_raw is not None else "[NO DATA]"
+        p_fcf      = _num(info.get("priceToFreeCashflows"))
+        ttm_pe     = _pe(info.get("trailingPE"))
+        fwd_pe     = _pe(info.get("forwardPE"))
+
+        # Rule of 40 = revenue growth % + net margin %
+        rule40 = "[NO DATA]"
+        if isinstance(rev_cagr, float) and isinstance(margin, float):
+            rule40 = round(rev_cagr + margin, 2)
+
+        mrq      = info.get("mostRecentQuarter")
+        rel_date = (datetime.fromtimestamp(mrq).strftime("%Y-%m-%d") if mrq else "N/A")
+
+        sector   = info.get("sector", "")
+        industry = info.get("industry", "")
+        is_bank  = any(k in (sector + industry).lower()
+                       for k in ["bank", "financ", "reit", "trust", "insur"])
+
+        return {
+            "company_name":   info.get("longName") or info.get("shortName") or fallback_name,
+            "releasing_date": rel_date,
+            "is_bank":        is_bank,
+            "eps_growth":     eps_growth,
+            "rev_cagr":       rev_cagr,
+            "roe":            roe,
+            "roic":           "[NO DATA]",   # requires manual balance-sheet calc
+            "p_fcf":          p_fcf,
+            "ttm_pe":         ttm_pe,
+            "forward_pe":     fwd_pe,
+            "margin":         margin,
+            "debt_equity":    debt_eq,
+            "rule_of_40":     rule40,
+        }
+
+    fa_reports  = []
+    fa_failures = []
+
+    for r in matched:
+        yf_t = f"{r['symbol']}.SI"
+        print(f"    FA → {r['symbol']:<8} {r['name'][:35]:<35}", end=" ", flush=True)
+        try:
+            fa_data      = _fetch_fa_data(yf_t, r["name"])
+            screener     = GlobalScreenerV59_CN(r["symbol"], r["last_close"], fa_data)
+            report_path  = screener.save_report(output_dir=FA_REPORTS_DIR)
+            fa_reports.append(report_path)
+            _, verdict_label, _ = screener.get_verdict()
+            print(f"✅  {verdict_label}")
+        except Exception as e:
+            fa_failures.append(r["symbol"])
+            print(f"❌  {e}")
+        time.sleep(0.5)   # be polite to Yahoo Finance
+
+    print(f"\n    FA reports saved  → {FA_REPORTS_DIR}/")
+    print(f"    Reports generated : {len(fa_reports)}")
+    if fa_failures:
+        print(f"    Failed            : {', '.join(fa_failures)}")
+
+print("\n" + "=" * 60)
+print("  DONE")
+print(f"  Scan results  : {OUTPUT_RESULTS}")
+print(f"  TV watchlist  : {OUTPUT_WATCHLIST}")
+print(f"  FA reports    : {FA_REPORTS_DIR}/")
+print("=" * 60)
+print("\nImport into TradingView:")
 print("  Watchlist → ⋮ → Import watchlist → sgx_watchlist.txt")
