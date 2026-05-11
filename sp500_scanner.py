@@ -571,9 +571,18 @@ print(f"    Benchmark: {BENCHMARK}")
 bench_raw   = yf.download(BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
 bench_close = bench_raw["Close"].squeeze()
 
-spy_raw        = yf.download("SPY", start=start_date, end=end_date, auto_adjust=True, progress=False)
-rsi_index_close = spy_raw["Close"].squeeze()
-print(f"    RSI index   : SPY  ({len(rsi_index_close)} bars)")
+spy_raw = yf.download("SPY", start=start_date, end=end_date, auto_adjust=True, progress=False)
+if spy_raw.empty or len(spy_raw) < RSI_PERIOD + 5:
+    print(f"    RSI index   : SPY download failed — falling back to ^GSPC")
+    rsi_index_close  = bench_close
+    rsi_index_label  = "^GSPC (fallback)"
+else:
+    rsi_index_close = spy_raw["Close"].squeeze()
+    rsi_index_label = "SPY"
+    last_bar   = rsi_index_close.index[-1]
+    last_close = float(rsi_index_close.iloc[-1])
+    print(f"    RSI index   : {rsi_index_label}  |  {len(rsi_index_close)} bars  "
+          f"|  last bar: {last_bar.date()}  close: {last_close:.2f}")
 
 all_tickers = list(ticker_info.keys())
 batches     = [all_tickers[i:i+BATCH_SIZE] for i in range(0, len(all_tickers), BATCH_SIZE)]
@@ -656,7 +665,7 @@ print(f"\n[3b/5] RSI-{RSI_PERIOD} comparison filter (threshold: index RSI + {RSI
 
 spy_rsi_series = calc_rsi(rsi_index_close.dropna(), RSI_PERIOD)
 index_rsi_val  = float(spy_rsi_series.iloc[-1])
-print(f"    SPY RSI-{RSI_PERIOD}: {index_rsi_val:.2f}")
+print(f"    {rsi_index_label} RSI-{RSI_PERIOD}: {index_rsi_val:.2f}")
 
 rsi_passed   = []
 rsi_excluded = []
@@ -675,7 +684,7 @@ for r in matched:
 print(f"    Matched: {len(matched)}  →  After RSI filter: {len(rsi_passed)}  "
       f"({len(rsi_excluded)} removed as overbought)")
 if rsi_excluded:
-    print(f"    Excluded (SPY RSI {index_rsi_val:.1f} + {RSI_THRESHOLD} threshold):")
+    print(f"    Excluded ({rsi_index_label} RSI {index_rsi_val:.1f} + {RSI_THRESHOLD} threshold):")
     for r in rsi_excluded:
         print(f"      {r['symbol']:<8} RSI={r['stock_rsi']:.2f}")
 
