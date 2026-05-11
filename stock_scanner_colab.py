@@ -65,6 +65,8 @@ SGX_MIN_VOLUME = 100_000
 SGX_MIN_PRICE  = 0.20
 US_MIN_VOLUME  = 200_000
 US_MIN_PRICE   = 10.00
+RSI_PERIOD     = 14
+RSI_THRESHOLD  = 3.0   # exclude if stock RSI > index RSI + this (percentage points)
 
 
 # ════════════════════════════════════════════════════════════
@@ -470,6 +472,40 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
     return out
 
 
+def calc_rsi(series, period=14):
+    """Wilder's smoothed RSI."""
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def apply_rsi_filter(matched, stock_data, index_close, index_label,
+                     rsi_period=14, threshold=3.0):
+    """
+    Remove entries from matched whose latest RSI exceeds
+    index_close latest RSI by more than threshold points.
+    Returns (passed, excluded) lists and the computed index RSI value.
+    """
+    idx_rsi_val = float(calc_rsi(index_close.dropna(), rsi_period).iloc[-1])
+    print(f"    {index_label} RSI-{rsi_period}: {idx_rsi_val:.2f}")
+    passed, excluded = [], []
+    for r in matched:
+        df = stock_data.get(r.get("yf_ticker", r["symbol"]))
+        if df is None or len(df) < rsi_period + 5:
+            passed.append(r)
+            continue
+        stock_rsi = float(calc_rsi(df["close"].dropna(), rsi_period).iloc[-1])
+        if stock_rsi > idx_rsi_val + threshold:
+            excluded.append({**r, "stock_rsi": round(stock_rsi, 2)})
+        else:
+            passed.append(r)
+    return passed, excluded, idx_rsi_val
+
+
 # ════════════════════════════════════════════════════════════
 # SHARED FA HELPER
 # Price comes from downloaded batch data (last_close),
@@ -609,7 +645,12 @@ print(f"\n[SGX 2/5] Downloading data ({start_date} → {end_date})...")
 print(f"    Benchmark: {SGX_BENCHMARK}")
 
 sti_raw   = yf.download(SGX_BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
-sti_close = sti_raw["Close"].squeeze()
+sti_close    = sti_raw["Close"].squeeze()
+sti_rsi_ok   = not sti_raw.empty and len(sti_close) >= RSI_PERIOD + 5
+if not sti_rsi_ok:
+    print(f"    WARNING: ^STI download failed or insufficient data — RSI filter will be skipped for SGX")
+else:
+    print(f"    ^STI  |  {len(sti_close)} bars  |  last bar: {sti_close.index[-1].date()}  close: {float(sti_close.iloc[-1]):.2f}")
 
 all_sgx  = list(sgx_ticker_info.keys())
 batches  = [all_sgx[i:i+BATCH_SIZE] for i in range(0, len(all_sgx), BATCH_SIZE)]
@@ -669,6 +710,21 @@ for idx, (yf_t, df) in enumerate(sgx_filtered.items()):
 sgx_matched = [r for r in sgx_results if r["signal_confirmed"]]
 print(f"\n    Done: {len(sgx_results)} scanned, {len(sgx_matched)} confirmed signals")
 
+# ── SGX Step 3b: RSI comparison filter (vs ^STI) ─────────────
+print(f"\n[SGX 3b/5] RSI-{RSI_PERIOD} filter (threshold: ^STI RSI + {RSI_THRESHOLD})...")
+if sti_rsi_ok:
+    sgx_rsi_passed, sgx_rsi_excluded, sgx_index_rsi = apply_rsi_filter(
+        sgx_matched, sgx_data, sti_close, "^STI", RSI_PERIOD, RSI_THRESHOLD)
+    print(f"    Matched: {len(sgx_matched)}  →  After RSI filter: {len(sgx_rsi_passed)}  "
+          f"({len(sgx_rsi_excluded)} removed as overbought vs ^STI)")
+    if sgx_rsi_excluded:
+        print(f"    Excluded (^STI RSI {sgx_index_rsi:.1f} + {RSI_THRESHOLD} threshold):")
+        for r in sgx_rsi_excluded:
+            print(f"      {r['symbol']:<8} RSI={r['stock_rsi']:.2f}")
+else:
+    sgx_rsi_passed = sgx_matched
+    print(f"    Skipped — ^STI data unavailable, using all {len(sgx_matched)} confirmed signals")
+
 # ── SGX Step 4: Export ───────────────────────────────────────
 print(f"\n[SGX 4/5] Exporting results...")
 fieldnames = ["symbol","name","market","signal_confirmed","sma_gap_buy","breakout_buy","obv_sell_ban","last_close","last_date","bars"]
@@ -679,27 +735,28 @@ with open(SGX_OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
 print(f"    Full results → {SGX_OUTPUT_RESULTS}")
 
 with open(SGX_OUTPUT_WATCHLIST, "w", encoding="utf-8") as f:
-    for r in sgx_matched: f.write(f"SGX:{r['symbol']}\n")
-print(f"    TV watchlist → {SGX_OUTPUT_WATCHLIST}  ({len(sgx_matched)} tickers)")
+    for r in sgx_rsi_passed: f.write(f"SGX:{r['symbol']}\n")
+print(f"    TV watchlist → {SGX_OUTPUT_WATCHLIST}  ({len(sgx_rsi_passed)} tickers, RSI-filtered)")
 
 print("\n" + "=" * 60)
-print(f"  SGX CONFIRMED SIGNALS ({len(sgx_matched)} stocks)")
+print(f"  SGX CONFIRMED SIGNALS — RSI filtered ({len(sgx_rsi_passed)} stocks)")
+print(f"  [Signal confirmed AND RSI-{RSI_PERIOD} ≤ ^STI RSI + {RSI_THRESHOLD}]")
 print("=" * 60)
-if sgx_matched:
+if sgx_rsi_passed:
     print(f"  {'Symbol':<8} {'Name':<30} {'Close':>8} {'SMA':^5} {'BO':^5} {'OBV':^5}")
-    for r in sgx_matched:
+    for r in sgx_rsi_passed:
         print(f"  {r['symbol']:<8} {r['name'][:30]:<30} S${r['last_close']:>6.3f} "
               f"{'Y' if r['sma_gap_buy'] else 'N':^5} "
               f"{'Y' if r['breakout_buy'] else 'N':^5} "
               f"{'Y' if r['obv_sell_ban'] else 'N':^5}")
 else:
-    print("  No confirmed signals today.")
+    print("  No stocks remain after RSI filter.")
 print("=" * 60)
 
 # ── SGX Step 5: FA scan ──────────────────────────────────────
-print(f"\n[SGX 5/5] FA scan on {len(sgx_matched)} confirmed SGX stocks...")
+print(f"\n[SGX 5/5] FA scan on {len(sgx_rsi_passed)} RSI-filtered SGX stocks...")
 print("    Note: price = last_close from downloaded batch data")
-run_fa_scan(sgx_matched, sgx_ticker_info, "SGX")
+run_fa_scan(sgx_rsi_passed, sgx_ticker_info, "SGX")
 
 
 # ════════════════════════════════════════════════════════════
@@ -739,6 +796,16 @@ print(f"    Benchmark: {US_BENCHMARK}")
 
 gspc_raw   = yf.download(US_BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
 gspc_close = gspc_raw["Close"].squeeze()
+
+spy_raw = yf.download("SPY", start=start_date, end=end_date, auto_adjust=True, progress=False)
+if spy_raw.empty or len(spy_raw) < RSI_PERIOD + 5:
+    print(f"    WARNING: SPY download failed — falling back to ^GSPC for RSI comparison")
+    spy_rsi_close = gspc_close
+    spy_rsi_label = "^GSPC (fallback)"
+else:
+    spy_rsi_close = spy_raw["Close"].squeeze()
+    spy_rsi_label = "SPY"
+    print(f"    SPY   |  {len(spy_rsi_close)} bars  |  last bar: {spy_rsi_close.index[-1].date()}  close: {float(spy_rsi_close.iloc[-1]):.2f}")
 
 all_us  = list(us_ticker_info.keys())
 batches = [all_us[i:i+BATCH_SIZE] for i in range(0, len(all_us), BATCH_SIZE)]
@@ -797,6 +864,17 @@ for idx, (sym, df) in enumerate(us_filtered.items()):
 us_matched = [r for r in us_results if r["signal_confirmed"]]
 print(f"\n    Done: {len(us_results)} scanned, {len(us_matched)} confirmed signals")
 
+# ── US Step 3b: RSI comparison filter (vs SPY) ───────────────
+print(f"\n[US 3b/5] RSI-{RSI_PERIOD} filter (threshold: {spy_rsi_label} RSI + {RSI_THRESHOLD})...")
+us_rsi_passed, us_rsi_excluded, us_index_rsi = apply_rsi_filter(
+    us_matched, us_data, spy_rsi_close, spy_rsi_label, RSI_PERIOD, RSI_THRESHOLD)
+print(f"    Matched: {len(us_matched)}  →  After RSI filter: {len(us_rsi_passed)}  "
+      f"({len(us_rsi_excluded)} removed as overbought vs {spy_rsi_label})")
+if us_rsi_excluded:
+    print(f"    Excluded ({spy_rsi_label} RSI {us_index_rsi:.1f} + {RSI_THRESHOLD} threshold):")
+    for r in us_rsi_excluded:
+        print(f"      {r['symbol']:<8} RSI={r['stock_rsi']:.2f}")
+
 # ── US Step 4: Export ────────────────────────────────────────
 print(f"\n[US 4/5] Exporting results...")
 with open(US_OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
@@ -806,27 +884,28 @@ with open(US_OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
 print(f"    Full results → {US_OUTPUT_RESULTS}")
 
 with open(US_OUTPUT_WATCHLIST, "w", encoding="utf-8") as f:
-    for r in us_matched: f.write(f"NYSE:{r['symbol']}\n")
-print(f"    TV watchlist → {US_OUTPUT_WATCHLIST}  ({len(us_matched)} tickers)")
+    for r in us_rsi_passed: f.write(f"NYSE:{r['symbol']}\n")
+print(f"    TV watchlist → {US_OUTPUT_WATCHLIST}  ({len(us_rsi_passed)} tickers, RSI-filtered)")
 
 print("\n" + "=" * 60)
-print(f"  US CONFIRMED SIGNALS ({len(us_matched)} stocks)")
+print(f"  US CONFIRMED SIGNALS — RSI filtered ({len(us_rsi_passed)} stocks)")
+print(f"  [Signal confirmed AND RSI-{RSI_PERIOD} ≤ {spy_rsi_label} RSI + {RSI_THRESHOLD}]")
 print("=" * 60)
-if us_matched:
+if us_rsi_passed:
     print(f"  {'Symbol':<8} {'Name':<30} {'Close':>8} {'SMA':^5} {'BO':^5} {'OBV':^5}")
-    for r in us_matched:
+    for r in us_rsi_passed:
         print(f"  {r['symbol']:<8} {r['name'][:30]:<30} US${r['last_close']:>7.2f} "
               f"{'Y' if r['sma_gap_buy'] else 'N':^5} "
               f"{'Y' if r['breakout_buy'] else 'N':^5} "
               f"{'Y' if r['obv_sell_ban'] else 'N':^5}")
 else:
-    print("  No confirmed signals today.")
+    print("  No stocks remain after RSI filter.")
 print("=" * 60)
 
 # ── US Step 5: FA scan ───────────────────────────────────────
-print(f"\n[US 5/5] FA scan on {len(us_matched)} confirmed US stocks...")
+print(f"\n[US 5/5] FA scan on {len(us_rsi_passed)} RSI-filtered US stocks...")
 print("    Note: price = last_close from downloaded batch data")
-run_fa_scan(us_matched, us_ticker_info, "US")
+run_fa_scan(us_rsi_passed, us_ticker_info, "US")
 
 
 # ════════════════════════════════════════════════════════════
@@ -836,10 +915,10 @@ print("\n\n" + "=" * 60)
 print("  ALL DONE")
 print("=" * 60)
 print(f"  SGX results  : {SGX_OUTPUT_RESULTS}")
-print(f"  SGX watchlist: {SGX_OUTPUT_WATCHLIST}  ({len(sgx_matched)} signals)")
+print(f"  SGX watchlist: {SGX_OUTPUT_WATCHLIST}  ({len(sgx_rsi_passed)} signals, RSI-filtered)")
 print(f"  US  results  : {US_OUTPUT_RESULTS}")
-print(f"  US  watchlist: {US_OUTPUT_WATCHLIST}  ({len(us_matched)} signals)")
-print(f"  FA  reports  : {FA_REPORTS_DIR}/  ({len(sgx_matched)+len(us_matched)} total)")
+print(f"  US  watchlist: {US_OUTPUT_WATCHLIST}  ({len(us_rsi_passed)} signals, RSI-filtered)")
+print(f"  FA  reports  : {FA_REPORTS_DIR}/  ({len(sgx_rsi_passed)+len(us_rsi_passed)} total)")
 print("=" * 60)
 print("\nImport into TradingView:")
 print("  Watchlist → ⋮ → Import watchlist → sgx_watchlist.txt / us_watchlist.txt")
