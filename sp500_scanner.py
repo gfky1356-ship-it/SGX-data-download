@@ -43,8 +43,10 @@ FA_REPORTS_DIR   = "/content/fa_reports"
 BATCH_SIZE       = 50
 BENCHMARK        = "^GSPC"
 
-MIN_VOLUME = 200_000
-MIN_PRICE  = 10.00
+MIN_VOLUME    = 200_000
+MIN_PRICE     = 10.00
+RSI_PERIOD    = 14
+RSI_THRESHOLD = 3.0   # exclude if stock RSI > index RSI + this (percentage points)
 
 
 # ════════════════════════════════════════════════════════════
@@ -445,6 +447,17 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
     return out
 
 
+def calc_rsi(series, period=14):
+    """Wilder's smoothed RSI."""
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
 # ════════════════════════════════════════════════════════════
 # FA HELPERS
 # Price comes from downloaded batch data (last_close),
@@ -630,6 +643,40 @@ print(f"\n    Done: {len(results)} scanned, {len(matched)} confirmed signals")
 
 
 # ════════════════════════════════════════════════════════════
+# STEP 3b — RSI comparison filter
+# Compare each confirmed stock's 14-RSI vs benchmark (^GSPC) 14-RSI.
+# Stocks whose RSI exceeds the index RSI by more than RSI_THRESHOLD are
+# considered overbought relative to the index and removed.
+# ════════════════════════════════════════════════════════════
+print(f"\n[3b/5] RSI-{RSI_PERIOD} comparison filter (threshold: index RSI + {RSI_THRESHOLD})...")
+
+bench_rsi_series = calc_rsi(bench_close.dropna(), RSI_PERIOD)
+index_rsi_val    = float(bench_rsi_series.iloc[-1])
+print(f"    S&P 500 (^GSPC) RSI-{RSI_PERIOD}: {index_rsi_val:.2f}")
+
+rsi_passed   = []
+rsi_excluded = []
+for r in matched:
+    sym = r["symbol"]
+    df  = stock_data.get(sym)
+    if df is None or len(df) < RSI_PERIOD + 5:
+        rsi_passed.append(r)   # keep if RSI can't be computed
+        continue
+    stock_rsi = float(calc_rsi(df["close"].dropna(), RSI_PERIOD).iloc[-1])
+    if stock_rsi > index_rsi_val + RSI_THRESHOLD:
+        rsi_excluded.append({**r, "stock_rsi": round(stock_rsi, 2)})
+    else:
+        rsi_passed.append(r)
+
+print(f"    Matched: {len(matched)}  →  After RSI filter: {len(rsi_passed)}  "
+      f"({len(rsi_excluded)} removed as overbought)")
+if rsi_excluded:
+    print(f"    Excluded (RSI > {index_rsi_val:.1f} + {RSI_THRESHOLD}):")
+    for r in rsi_excluded:
+        print(f"      {r['symbol']:<8} RSI={r['stock_rsi']:.2f}")
+
+
+# ════════════════════════════════════════════════════════════
 # STEP 4 — Export results
 # ════════════════════════════════════════════════════════════
 print(f"\n[4/5] Exporting results...")
@@ -642,30 +689,31 @@ with open(OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
 print(f"    Full results → {OUTPUT_RESULTS}")
 
 with open(OUTPUT_WATCHLIST, "w", encoding="utf-8") as f:
-    for r in matched: f.write(f"NYSE:{r['symbol']}\n")
-print(f"    TV watchlist → {OUTPUT_WATCHLIST}  ({len(matched)} tickers)")
+    for r in rsi_passed: f.write(f"NYSE:{r['symbol']}\n")
+print(f"    TV watchlist → {OUTPUT_WATCHLIST}  ({len(rsi_passed)} tickers, RSI-filtered)")
 
 print("\n" + "=" * 65)
-print(f"  CONFIRMED SIGNALS ({len(matched)} stocks)")
+print(f"  CONFIRMED SIGNALS — RSI filtered ({len(rsi_passed)} stocks)")
+print(f"  [Signal confirmed AND RSI-{RSI_PERIOD} ≤ index RSI + {RSI_THRESHOLD}]")
 print("=" * 65)
-if matched:
+if rsi_passed:
     print(f"  {'Symbol':<8} {'Name':<28} {'Sector':<22} {'SMA':^5} {'BO':^5} {'OBV':^5}")
-    for r in sorted(matched, key=lambda x: x["sector"]):
+    for r in sorted(rsi_passed, key=lambda x: x["sector"]):
         print(f"  {r['symbol']:<8} {r['name'][:28]:<28} {r['sector'][:22]:<22} "
               f"{'Y' if r['sma_gap_buy'] else 'N':^5} "
               f"{'Y' if r['breakout_buy'] else 'N':^5} "
               f"{'Y' if r['obv_sell_ban'] else 'N':^5}")
 else:
-    print("  No confirmed signals today.")
+    print("  No stocks remain after RSI filter.")
 print("=" * 65)
 
 
 # ════════════════════════════════════════════════════════════
 # STEP 5 — FA scan on confirmed signals
 # ════════════════════════════════════════════════════════════
-print(f"\n[5/5] FA scan on {len(matched)} confirmed stocks...")
+print(f"\n[5/5] FA scan on {len(rsi_passed)} RSI-filtered stocks...")
 print("    Note: price = last_close from downloaded batch data")
-run_fa_scan(matched)
+run_fa_scan(rsi_passed)
 
 print("\nDone! Import into TradingView:")
 print("  Watchlist → ⋮ → Import watchlist → sp500_watchlist.txt")
