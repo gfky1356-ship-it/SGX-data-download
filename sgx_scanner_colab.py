@@ -19,9 +19,18 @@
 # obv sell_ban is ON when OBV long SMA slope > 0
 # (volume accumulation trend is still rising — don't sell)
 #
+# Filters applied after data download:
+#   volume > 100,000  AND  price > 0.20
+#   Only stocks passing both filters proceed to scanning.
+#
+# FA data sources (in priority order):
+#   1. Yahoo Finance (yfinance)  — primary, all fields
+#   2. SGX API                   — fallback for P/E, P/B, yield, EPS, mkt cap
+#
 # Outputs:
-#   /content/sgx_scan_results.csv   full results for all stocks
-#   /content/sgx_watchlist.txt      TradingView watchlist (confirmed only)
+#   /content/sgx_scan_results.csv        full results for filtered stocks
+#   /content/sgx_watchlist.txt           TradingView watchlist (confirmed only)
+#   /content/fa_reports/<TICKER>_FA_...  HTML FA report per confirmed stock
 # ============================================================
 
 # ── Cell 1: Install ─────────────────────────────────────────
@@ -29,7 +38,7 @@
 
 
 # ── Cell 2: Run Scanner ──────────────────────────────────────
-import csv, time, warnings
+import csv, importlib.util, os, time, warnings
 import numpy as np
 import pandas as pd
 import requests
@@ -40,8 +49,13 @@ warnings.filterwarnings("ignore")
 
 OUTPUT_RESULTS   = "/content/sgx_scan_results.csv"
 OUTPUT_WATCHLIST = "/content/sgx_watchlist.txt"
+FA_REPORTS_DIR   = "/content/fa_reports"
 BATCH_SIZE       = 50
 BENCHMARK        = "^STI"
+
+# Volume and price thresholds for pre-scan filter
+MIN_VOLUME = 100_000
+MIN_PRICE  = 0.20
 
 
 # ════════════════════════════════════════════════════════════
@@ -216,11 +230,13 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
 
 # ════════════════════════════════════════════════════════════
 # STEP 1 — Fetch SGX stock list
+# Extended fields (pe, pb, yld, eps, mc) are stored here and
+# used as FA fallback in Step 5 when Yahoo Finance is empty.
 # ════════════════════════════════════════════════════════════
 print("=" * 55)
 print("  SGX STOCK SCANNER")
 print("=" * 55)
-print("\n[1/4] Fetching SGX stock list...")
+print("\n[1/5] Fetching SGX stock list...")
 
 resp = requests.get(
     "https://api.sgx.com/securities/v1.1/",
@@ -230,7 +246,17 @@ resp = requests.get(
 resp.raise_for_status()
 stocks = [s for s in resp.json()["data"]["prices"] if s.get("type") == "stocks"]
 ticker_info = {
-    f"{s['nc']}.SI": {"symbol": s["nc"], "name": s.get("n", ""), "market": s.get("m", "")}
+    f"{s['nc']}.SI": {
+        "symbol": s["nc"],
+        "name":   s.get("n", ""),
+        "market": s.get("m", ""),
+        # SGX API FA fields — fallback when Yahoo Finance unavailable
+        "sgx_pe":  s.get("pe"),                      # trailing P/E
+        "sgx_pb":  s.get("pb"),                      # P/B ratio
+        "sgx_yld": s.get("yld") or s.get("dy"),      # dividend yield %
+        "sgx_eps": s.get("eps") or s.get("es"),      # EPS (S$)
+        "sgx_mc":  s.get("mc")  or s.get("mktcap"),  # market cap
+    }
     for s in stocks if s.get("nc")
 }
 print(f"    Found {len(ticker_info)} stocks")
@@ -241,7 +267,7 @@ print(f"    Found {len(ticker_info)} stocks")
 # ════════════════════════════════════════════════════════════
 end_date   = datetime.today().strftime("%Y-%m-%d")
 start_date = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
-print(f"\n[2/4] Downloading data ({start_date} → {end_date})...")
+print(f"\n[2/5] Downloading data ({start_date} → {end_date})...")
 print(f"    Fetching benchmark {BENCHMARK}...")
 
 sti_raw   = yf.download(BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
@@ -276,9 +302,28 @@ print(f"    Total stocks with data: {len(stock_data)}")
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 3 — Run scanners, check last bar
+# STEP 2b — Filter: volume > 100,000 AND price > 0.20
+# Only qualified stocks proceed to scanning.
 # ════════════════════════════════════════════════════════════
-print(f"\n[3/4] Running scanners on {len(stock_data)} stocks...")
+print(f"\n[2b/5] Applying filters  (volume > {MIN_VOLUME:,}  AND  price > {MIN_PRICE})...")
+
+filtered_data = {}
+for t, df in stock_data.items():
+    last_vol   = float(df["volume"].iloc[-1])
+    last_close = float(df["close"].iloc[-1])
+    if last_vol > MIN_VOLUME and last_close > MIN_PRICE:
+        filtered_data[t] = df
+
+print(f"    Before filter : {len(stock_data)} stocks")
+print(f"    After  filter : {len(filtered_data)} stocks  "
+      f"({len(stock_data) - len(filtered_data)} removed)")
+stock_data = filtered_data
+
+
+# ════════════════════════════════════════════════════════════
+# STEP 3 — Run scanners on filtered tickers, check last bar
+# ════════════════════════════════════════════════════════════
+print(f"\n[3/5] Running scanners on {len(stock_data)} filtered stocks...")
 
 results  = []
 min_bars = 110   # OBV long SMA needs 100 bars minimum
@@ -315,17 +360,17 @@ for idx, (yf_t, df) in enumerate(stock_data.items()):
         pass
 
     if (idx + 1) % 50 == 0:
-        matched = sum(1 for r in results if r["signal_confirmed"])
-        print(f"    {idx+1}/{len(stock_data)} scanned | {matched} confirmed so far")
+        matched_so_far = sum(1 for r in results if r["signal_confirmed"])
+        print(f"    {idx+1}/{len(stock_data)} scanned | {matched_so_far} confirmed so far")
 
 matched = [r for r in results if r["signal_confirmed"]]
 print(f"\n    Scan complete: {len(results)} scanned, {len(matched)} confirmed signals")
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 4 — Export results
+# STEP 4 — Export scan results
 # ════════════════════════════════════════════════════════════
-print(f"\n[4/4] Exporting results...")
+print(f"\n[4/5] Exporting scan results...")
 
 fieldnames = ["symbol", "name", "market", "signal_confirmed",
               "sma_gap_buy", "breakout_buy", "obv_sell_ban",
@@ -356,5 +401,167 @@ if matched:
 else:
     print("  No confirmed signals today.")
 print("=" * 60)
-print("\nDone! Import into TradingView:")
+
+
+# ════════════════════════════════════════════════════════════
+# STEP 5 — FA Scan: run GlobalScreenerV59_CN on each
+#          confirmed stock and export an HTML report.
+#
+# Requires: "Glaude Global_FA_Scan_CN_5_9 .py" in the same
+#           directory as this script.
+#
+# FA data priority:
+#   1. Yahoo Finance (yfinance) — all fields attempted first
+#   2. SGX API                  — fallback for fields that
+#      Yahoo Finance could not provide (P/E, P/B, yield, EPS)
+# ════════════════════════════════════════════════════════════
+print(f"\n[5/5] Running FA scan on {len(matched)} confirmed stocks...")
+
+_fa_filename = "Glaude Global_FA_Scan_CN_5_9 .py"
+_fa_path     = os.path.join(os.getcwd(), _fa_filename)
+
+if not matched:
+    print("    No confirmed signals — FA scan skipped.")
+elif not os.path.exists(_fa_path):
+    print(f"    WARNING: FA scan file not found at:\n      {_fa_path}")
+    print(f"    Ensure '{_fa_filename}' is in the same directory.")
+else:
+    # Dynamically load GlobalScreenerV59_CN from the FA scan file
+    _spec = importlib.util.spec_from_file_location("fa_scan", _fa_path)
+    _fa_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_fa_mod)
+    GlobalScreenerV59_CN = _fa_mod.GlobalScreenerV59_CN
+
+    os.makedirs(FA_REPORTS_DIR, exist_ok=True)
+
+    def _sgx_float(sgx_info, key):
+        """Safely parse an SGX API value (may be string, '--', None) to float."""
+        v = sgx_info.get(key)
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _fetch_fa_data(yf_ticker, fallback_name, sgx_info):
+        """
+        Fetch FA fundamentals for one stock.
+
+        Priority order per field:
+          1. Yahoo Finance (yfinance .info dict)
+          2. SGX API data already captured in Step 1
+          3. [NO DATA] — handled gracefully by the screener
+        """
+        # ── 1. Yahoo Finance ────────────────────────────────
+        try:
+            yf_info = yf.Ticker(yf_ticker).info
+            if not yf_info or yf_info.get("regularMarketPrice") is None:
+                yf_info = {}
+        except Exception:
+            yf_info = {}
+
+        # ── 2. SGX API fallback values ───────────────────────
+        sgx_pe  = _sgx_float(sgx_info, "sgx_pe")
+        sgx_pb  = _sgx_float(sgx_info, "sgx_pb")   # not used in screener yet, stored for reference
+        sgx_eps = _sgx_float(sgx_info, "sgx_eps")  # S$ EPS — used to flag data availability
+
+        # ── Helper converters ────────────────────────────────
+        def _pct(v):
+            return round(v * 100, 2) if v is not None else "[NO DATA]"
+
+        def _num(v, dp=2):
+            return round(v, dp) if v is not None else "[NO DATA]"
+
+        def _pe(v):
+            return round(v, 2) if v is not None else "—"
+
+        # ── Field mapping (Yahoo first, SGX fallback) ────────
+        # P/E: Yahoo trailingPE → SGX pe
+        yf_pe  = yf_info.get("trailingPE")
+        ttm_pe = _pe(yf_pe if yf_pe is not None else sgx_pe)
+
+        # Forward P/E: Yahoo only
+        fwd_pe = _pe(yf_info.get("forwardPE"))
+
+        # Profitability & growth: Yahoo only
+        roe        = _pct(yf_info.get("returnOnEquity"))
+        margin     = _pct(yf_info.get("profitMargins"))
+        rev_cagr   = _pct(yf_info.get("revenueGrowth"))
+        eps_raw    = yf_info.get("earningsGrowth") or yf_info.get("earningsQuarterlyGrowth")
+        eps_growth = _pct(eps_raw)
+        de_raw     = yf_info.get("debtToEquity")
+        debt_eq    = round(de_raw / 100, 2) if de_raw is not None else "[NO DATA]"
+        p_fcf      = _num(yf_info.get("priceToFreeCashflows"))
+
+        # Rule of 40 = revenue growth % + net margin %
+        rule40 = "[NO DATA]"
+        if isinstance(rev_cagr, float) and isinstance(margin, float):
+            rule40 = round(rev_cagr + margin, 2)
+
+        # Most recent quarter date
+        mrq      = yf_info.get("mostRecentQuarter")
+        rel_date = datetime.fromtimestamp(mrq).strftime("%Y-%m-%d") if mrq else "N/A"
+
+        # Bank / REIT detection
+        sector   = yf_info.get("sector", "")
+        industry = yf_info.get("industry", "")
+        is_bank  = any(k in (sector + industry).lower()
+                       for k in ["bank", "financ", "reit", "trust", "insur"])
+
+        # Company name: Yahoo → SGX name field → fallback
+        company_name = (yf_info.get("longName") or yf_info.get("shortName")
+                        or sgx_info.get("name") or fallback_name)
+
+        # Log which source was used for P/E
+        pe_source = "Yahoo" if yf_pe is not None else ("SGX" if sgx_pe is not None else "N/A")
+
+        return {
+            "company_name":   company_name,
+            "releasing_date": rel_date,
+            "is_bank":        is_bank,
+            "eps_growth":     eps_growth,
+            "rev_cagr":       rev_cagr,
+            "roe":            roe,
+            "roic":           "[NO DATA]",   # requires balance-sheet calculation
+            "p_fcf":          p_fcf,
+            "ttm_pe":         ttm_pe,
+            "forward_pe":     fwd_pe,
+            "margin":         margin,
+            "debt_equity":    debt_eq,
+            "rule_of_40":     rule40,
+            "_pe_source":     pe_source,     # internal — for console log only
+        }
+
+    fa_reports  = []
+    fa_failures = []
+
+    for r in matched:
+        yf_t     = f"{r['symbol']}.SI"
+        sgx_info = ticker_info.get(yf_t, {})
+        print(f"    FA → {r['symbol']:<8} {r['name'][:32]:<32}", end=" ", flush=True)
+        try:
+            fa_data     = _fetch_fa_data(yf_t, r["name"], sgx_info)
+            pe_src      = fa_data.pop("_pe_source", "?")   # remove internal key before passing to screener
+            screener    = GlobalScreenerV59_CN(r["symbol"], r["last_close"], fa_data)
+            report_path = screener.save_report(output_dir=FA_REPORTS_DIR)
+            fa_reports.append(report_path)
+            _, verdict_label, _ = screener.get_verdict()
+            print(f"✅  {verdict_label}  [PE src: {pe_src}]")
+        except Exception as e:
+            fa_failures.append(r["symbol"])
+            print(f"❌  {e}")
+        time.sleep(0.5)   # be polite to Yahoo Finance
+
+    print(f"\n    FA reports saved  → {FA_REPORTS_DIR}/")
+    print(f"    Reports generated : {len(fa_reports)}")
+    if fa_failures:
+        print(f"    Failed            : {', '.join(fa_failures)}")
+
+print("\n" + "=" * 60)
+print("  DONE")
+print(f"  Scan results  : {OUTPUT_RESULTS}")
+print(f"  TV watchlist  : {OUTPUT_WATCHLIST}")
+print(f"  FA reports    : {FA_REPORTS_DIR}/")
+print("=" * 60)
+print("\nImport into TradingView:")
 print("  Watchlist → ⋮ → Import watchlist → sgx_watchlist.txt")
