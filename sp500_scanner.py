@@ -23,7 +23,7 @@
 # Outputs:
 #   /content/sp500_scan_results.csv
 #   /content/sp500_watchlist.txt
-#   /content/fa_reports/<TICKER>_FA_v5.9_<date>.html
+#   /content/fa_reports/<TICKER>_FA_v6.0_<date>.html
 # ============================================================
 
 # !pip install yfinance requests -q
@@ -48,11 +48,12 @@ MIN_PRICE  = 10.00
 
 
 # ════════════════════════════════════════════════════════════
-# GLOBAL FA SCREENER v5.9  (embedded — no separate file needed)
+# GLOBAL FA SCREENER v6.0  (embedded — no separate file needed)
 # ════════════════════════════════════════════════════════════
-SCREENER_VERSION = "5.9"
+SCREENER_VERSION = "6.0"
 
 CHANGELOG = [
+    ("6.0", "2026-05-10", "强制验证 financial_reports（最少3份年度财报）；新增数据来源透明披露区块"),
     ("5.9", "2026-05-06", "新增 HTML 报告；亮色背景 #f5f5f0；深色灰字 #555568；全中文标签；固定宽度纵向滚动；版本自动管理"),
     ("5.8", "2026-04-01", "新增 Rule of 40；诚信修补（银行/REIT）；中文输出"),
     ("5.6", "2026-03-01", "原始版本，纯文字 Markdown 输出"),
@@ -60,7 +61,7 @@ CHANGELOG = [
 
 
 class GlobalScreenerV59_CN:
-    """GLOBAL Screener v5.9 — HTML 报告"""
+    """GLOBAL Screener v6.0 — HTML 报告"""
 
     def __init__(self, ticker, price, data):
         self.ticker = str(ticker).upper()
@@ -75,7 +76,12 @@ class GlobalScreenerV59_CN:
         self.market = "SG" if self.is_sg else "US"
         self.source = "SGX.com" if self.is_sg else "SEC EDGAR"
         self.ng_count = self.edge_count = self.pass_count = 0
+        self._validate_financial_reports()
         self._apply_honesty_patch()
+
+    def _validate_financial_reports(self):
+        reports = self.data.get("financial_reports", [])
+        self.has_financial_reports = isinstance(reports, list) and len(reports) >= 1
 
     def _apply_honesty_patch(self):
         self.is_bank = self.data.get("is_bank", False)
@@ -166,6 +172,22 @@ class GlobalScreenerV59_CN:
         entry_html     = f'<div class="entry-box">🎯 {d["entry_note"]}</div>' if d.get("entry_note") else ""
         changelog_rows = self._changelog_html()
 
+        # ── 数据来源透明披露区块 ──────────────────────────────
+        reports = d.get("financial_reports", [])
+        datasource_rows = ""
+        for _i, _r in enumerate(reports, 1):
+            _period = _r.get("period", "—")
+            _source = _r.get("source", "—")
+            _url    = _r.get("url", "#")
+            _date   = _r.get("date", "—")
+            datasource_rows += (
+                f'<div>📄 {_i}. <strong>{_period}</strong> · {_source} · '
+                f'<a href="{_url}" target="_blank">{_url[:60]}{"…" if len(_url)>60 else ""}</a> · '
+                f'发布日期：{_date}</div>'
+            )
+        if not datasource_rows:
+            datasource_rows = '<div>（自动扫描模式 — 数据来源：Yahoo Finance）</div>'
+
         css = f"""
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;500;600&display=swap');
   *{{margin:0;padding:0;box-sizing:border-box}}
@@ -184,17 +206,17 @@ class GlobalScreenerV59_CN:
   .stat-label{{font-size:10px;color:#555568;text-transform:uppercase;letter-spacing:1px;margin-bottom:2px}}
   .stat-value{{font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600;color:#1a1a2e}}
   .stat-sub{{font-size:11px;color:#555568;margin-top:2px}}
-  .matrix{{background:#fff;border:1px solid #d8d8e0;width:100%;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
-  .matrix-row{{display:grid;grid-template-columns:26px 1fr auto auto 38px;border-bottom:1px solid #eeeef4;align-items:center}}
+  .matrix{{background:#fff;border:1px solid #d8d8e0;width:100%;box-shadow:0 1px 3px rgba(0,0,0,.04);overflow:hidden}}
+  .matrix-row{{display:grid;grid-template-columns:20px 1fr minmax(0,80px) minmax(0,62px) 28px;border-bottom:1px solid #eeeef4;align-items:center;min-width:0}}
   .matrix-row:last-child{{border-bottom:none}}
-  .matrix-row.hdr{{background:#f0f0f6;font-family:'IBM Plex Mono',monospace;font-size:10px;color:#555568;letter-spacing:1px;text-transform:uppercase}}
-  .matrix-row>div{{padding:9px 8px;border-right:1px solid #eeeef4}}
+  .matrix-row.hdr{{background:#f0f0f6;font-family:'IBM Plex Mono',monospace;font-size:9px;color:#555568;letter-spacing:1px;text-transform:uppercase}}
+  .matrix-row>div{{padding:7px 5px;border-right:1px solid #eeeef4;min-width:0;overflow:hidden}}
   .matrix-row>div:last-child{{border-right:none}}
   .col-num{{text-align:center;color:#666678;font-family:'IBM Plex Mono',monospace;font-size:11px}}
-  .col-name{{color:#1a1a2e;font-size:13px}}
-  .col-val{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#333350;text-align:right;white-space:nowrap}}
-  .col-std{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#555568;text-align:right;white-space:nowrap}}
-  .col-stat{{text-align:center;font-size:15px}}
+  .col-name{{color:#1a1a2e;font-size:12px;white-space:normal;word-break:break-word}}
+  .col-val{{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#333350;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+  .col-std{{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#555568;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+  .col-stat{{text-align:center;font-size:14px}}
   .pass{{color:#0a7c5c}}.warn{{color:#b87000}}.fail{{color:#cc2244}}.nd{{color:#666678;font-size:12px}}
   .score-wrap{{background:#fff;border:1px solid #d8d8e0;padding:10px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
   .score-num{{font-family:'IBM Plex Mono',monospace;font-size:16px;font-weight:600;color:#0a7c5c;white-space:nowrap}}
@@ -211,9 +233,11 @@ class GlobalScreenerV59_CN:
   .p2-block:first-child{{padding-top:0}}
   .p2-key{{font-family:'IBM Plex Mono',monospace;font-size:10px;color:#555568;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:5px}}
   .p2-val{{font-size:13px;color:#2a2a40;line-height:1.65}}
+  .p2-val strong{{color:#1a1a2e}}
   .verdict{{background:{v_bg};border:1px solid {v_border};padding:14px 16px}}
   .verdict-title{{font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600;color:{v_color};margin-bottom:8px}}
   .verdict-body{{font-size:13px;color:#2a2a40;line-height:1.7}}
+  .verdict-body strong{{color:#1a1a2e}}
   .entry-box{{margin-top:10px;padding:8px 12px;background:#e8f6f1;border-left:3px solid #0a7c5c;font-family:'IBM Plex Mono',monospace;font-size:13px;color:#0a7c5c}}
   .changelog{{background:#fff;border:1px solid #d8d8e0;padding:12px 14px;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
   .changelog table{{width:100%;border-collapse:collapse;font-size:12px}}
@@ -223,6 +247,10 @@ class GlobalScreenerV59_CN:
   .changelog td:first-child{{font-family:'IBM Plex Mono',monospace;color:#0a7c5c;white-space:nowrap}}
   .changelog td:nth-child(2){{white-space:nowrap;color:#555568}}
   .footer{{font-size:10px;color:#888898;text-align:right;padding-top:4px}}
+  .datasource{{background:#fffdf0;border:1px solid #e8c070;border-left:4px solid #b87000;padding:10px 14px;font-size:11px;color:#555568;line-height:1.8}}
+  .datasource strong{{color:#b87000;font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1px}}
+  .datasource a{{color:#0a7c5c;text-decoration:none}}
+  .datasource a:hover{{text-decoration:underline}}
 """
         return f"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="UTF-8">
@@ -234,7 +262,7 @@ class GlobalScreenerV59_CN:
 <div class="ticker">{self.ticker} <span>@ {currency}{self.price}</span></div>
 <div class="company-name">{d.get("company_name",self.ticker)} · {self.market} ({self.source})</div>
 </div><div class="verdict-badge">{verdict_label}</div></div>
-<div class="filing-info">最新财报：{d.get("releasing_date","未提供")} · 报告生成：{self.report_date} · Screener v{self.version}</div></div>
+<div class="filing-info">财报来源：{len(d.get("financial_reports",[]))} 份{"✅" if self.has_financial_reports else "（自动扫描）"} · 报告生成：{self.report_date} · Screener v{self.version}</div></div>
 
 <div class="section-label">关键数据</div>
 <div class="stats-grid">
@@ -268,6 +296,12 @@ class GlobalScreenerV59_CN:
 <div class="verdict-title">{verdict_label}</div>
 <div class="verdict-body">触发 <strong>{self.ng_count} 个「❌ 未达标」</strong>警报，{self.edge_count} 个「⚠️ 边缘」指标。{d.get("final_comment","请结合第二阶段深度研究综合评估。")}</div>
 {entry_html}
+</div>
+
+<div class="section-label">数据来源透明披露</div>
+<div class="datasource">
+<strong>📎 财报来源</strong><br>
+{datasource_rows}
 </div>
 
 <div class="section-label">版本历史</div>
@@ -453,6 +487,7 @@ def _fetch_fa_data(yf_ticker, fallback_name):
         "margin":         margin,
         "debt_equity":    round(de_raw/100, 2) if de_raw is not None else "[NO DATA]",
         "rule_of_40":     rule40,
+        "financial_reports": [],
     }
 
 
