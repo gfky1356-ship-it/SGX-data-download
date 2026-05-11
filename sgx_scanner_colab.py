@@ -678,7 +678,13 @@ print("=" * 60)
 # ── US Step 1: Fetch S&P 500 ticker list ────────────────────
 print("\n[US 1/5] Fetching S&P 500 stock list from Wikipedia...")
 try:
-    sp500_df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    wiki_resp = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+        timeout=30,
+    )
+    wiki_resp.raise_for_status()
+    sp500_df = pd.read_html(wiki_resp.text)[0]
     us_ticker_info = {}
     for _, row in sp500_df.iterrows():
         raw_sym = str(row["Symbol"]).replace(".", "-")   # BRK.B → BRK-B for Yahoo Finance
