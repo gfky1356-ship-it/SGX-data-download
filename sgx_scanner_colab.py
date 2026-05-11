@@ -23,6 +23,10 @@
 #   volume > 100,000  AND  price > 0.20
 #   Only stocks passing both filters proceed to scanning.
 #
+# FA data sources (in priority order):
+#   1. Yahoo Finance (yfinance)  — primary, all fields
+#   2. SGX API                   — fallback for P/E, P/B, yield, EPS, mkt cap
+#
 # Outputs:
 #   /content/sgx_scan_results.csv        full results for filtered stocks
 #   /content/sgx_watchlist.txt           TradingView watchlist (confirmed only)
@@ -226,6 +230,8 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
 
 # ════════════════════════════════════════════════════════════
 # STEP 1 — Fetch SGX stock list
+# Extended fields (pe, pb, yld, eps, mc) are stored here and
+# used as FA fallback in Step 5 when Yahoo Finance is empty.
 # ════════════════════════════════════════════════════════════
 print("=" * 55)
 print("  SGX STOCK SCANNER")
@@ -240,7 +246,17 @@ resp = requests.get(
 resp.raise_for_status()
 stocks = [s for s in resp.json()["data"]["prices"] if s.get("type") == "stocks"]
 ticker_info = {
-    f"{s['nc']}.SI": {"symbol": s["nc"], "name": s.get("n", ""), "market": s.get("m", "")}
+    f"{s['nc']}.SI": {
+        "symbol": s["nc"],
+        "name":   s.get("n", ""),
+        "market": s.get("m", ""),
+        # SGX API FA fields — fallback when Yahoo Finance unavailable
+        "sgx_pe":  s.get("pe"),                      # trailing P/E
+        "sgx_pb":  s.get("pb"),                      # P/B ratio
+        "sgx_yld": s.get("yld") or s.get("dy"),      # dividend yield %
+        "sgx_eps": s.get("eps") or s.get("es"),      # EPS (S$)
+        "sgx_mc":  s.get("mc")  or s.get("mktcap"),  # market cap
+    }
     for s in stocks if s.get("nc")
 }
 print(f"    Found {len(ticker_info)} stocks")
@@ -393,9 +409,11 @@ print("=" * 60)
 #
 # Requires: "Glaude Global_FA_Scan_CN_5_9 .py" in the same
 #           directory as this script.
-# Fundamental data is fetched from Yahoo Finance (yfinance).
-# Fields unavailable from yfinance are marked [NO DATA] and
-# handled gracefully by the screener class.
+#
+# FA data priority:
+#   1. Yahoo Finance (yfinance) — all fields attempted first
+#   2. SGX API                  — fallback for fields that
+#      Yahoo Finance could not provide (P/E, P/B, yield, EPS)
 # ════════════════════════════════════════════════════════════
 print(f"\n[5/5] Running FA scan on {len(matched)} confirmed stocks...")
 
@@ -416,13 +434,38 @@ else:
 
     os.makedirs(FA_REPORTS_DIR, exist_ok=True)
 
-    def _fetch_fa_data(yf_ticker, fallback_name):
-        """Fetch fundamental data from yfinance and map to screener fields."""
+    def _sgx_float(sgx_info, key):
+        """Safely parse an SGX API value (may be string, '--', None) to float."""
+        v = sgx_info.get(key)
         try:
-            info = yf.Ticker(yf_ticker).info
-        except Exception:
-            info = {}
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
 
+    def _fetch_fa_data(yf_ticker, fallback_name, sgx_info):
+        """
+        Fetch FA fundamentals for one stock.
+
+        Priority order per field:
+          1. Yahoo Finance (yfinance .info dict)
+          2. SGX API data already captured in Step 1
+          3. [NO DATA] — handled gracefully by the screener
+        """
+        # ── 1. Yahoo Finance ────────────────────────────────
+        try:
+            yf_info = yf.Ticker(yf_ticker).info
+            if not yf_info or yf_info.get("regularMarketPrice") is None:
+                yf_info = {}
+        except Exception:
+            yf_info = {}
+
+        # ── 2. SGX API fallback values ───────────────────────
+        sgx_pe  = _sgx_float(sgx_info, "sgx_pe")
+        sgx_pb  = _sgx_float(sgx_info, "sgx_pb")   # not used in screener yet, stored for reference
+        sgx_eps = _sgx_float(sgx_info, "sgx_eps")  # S$ EPS — used to flag data availability
+
+        # ── Helper converters ────────────────────────────────
         def _pct(v):
             return round(v * 100, 2) if v is not None else "[NO DATA]"
 
@@ -432,59 +475,78 @@ else:
         def _pe(v):
             return round(v, 2) if v is not None else "—"
 
-        roe        = _pct(info.get("returnOnEquity"))
-        margin     = _pct(info.get("profitMargins"))
-        rev_cagr   = _pct(info.get("revenueGrowth"))
-        eps_raw    = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")
+        # ── Field mapping (Yahoo first, SGX fallback) ────────
+        # P/E: Yahoo trailingPE → SGX pe
+        yf_pe  = yf_info.get("trailingPE")
+        ttm_pe = _pe(yf_pe if yf_pe is not None else sgx_pe)
+
+        # Forward P/E: Yahoo only
+        fwd_pe = _pe(yf_info.get("forwardPE"))
+
+        # Profitability & growth: Yahoo only
+        roe        = _pct(yf_info.get("returnOnEquity"))
+        margin     = _pct(yf_info.get("profitMargins"))
+        rev_cagr   = _pct(yf_info.get("revenueGrowth"))
+        eps_raw    = yf_info.get("earningsGrowth") or yf_info.get("earningsQuarterlyGrowth")
         eps_growth = _pct(eps_raw)
-        de_raw     = info.get("debtToEquity")
+        de_raw     = yf_info.get("debtToEquity")
         debt_eq    = round(de_raw / 100, 2) if de_raw is not None else "[NO DATA]"
-        p_fcf      = _num(info.get("priceToFreeCashflows"))
-        ttm_pe     = _pe(info.get("trailingPE"))
-        fwd_pe     = _pe(info.get("forwardPE"))
+        p_fcf      = _num(yf_info.get("priceToFreeCashflows"))
 
         # Rule of 40 = revenue growth % + net margin %
         rule40 = "[NO DATA]"
         if isinstance(rev_cagr, float) and isinstance(margin, float):
             rule40 = round(rev_cagr + margin, 2)
 
-        mrq      = info.get("mostRecentQuarter")
-        rel_date = (datetime.fromtimestamp(mrq).strftime("%Y-%m-%d") if mrq else "N/A")
+        # Most recent quarter date
+        mrq      = yf_info.get("mostRecentQuarter")
+        rel_date = datetime.fromtimestamp(mrq).strftime("%Y-%m-%d") if mrq else "N/A"
 
-        sector   = info.get("sector", "")
-        industry = info.get("industry", "")
+        # Bank / REIT detection
+        sector   = yf_info.get("sector", "")
+        industry = yf_info.get("industry", "")
         is_bank  = any(k in (sector + industry).lower()
                        for k in ["bank", "financ", "reit", "trust", "insur"])
 
+        # Company name: Yahoo → SGX name field → fallback
+        company_name = (yf_info.get("longName") or yf_info.get("shortName")
+                        or sgx_info.get("name") or fallback_name)
+
+        # Log which source was used for P/E
+        pe_source = "Yahoo" if yf_pe is not None else ("SGX" if sgx_pe is not None else "N/A")
+
         return {
-            "company_name":   info.get("longName") or info.get("shortName") or fallback_name,
+            "company_name":   company_name,
             "releasing_date": rel_date,
             "is_bank":        is_bank,
             "eps_growth":     eps_growth,
             "rev_cagr":       rev_cagr,
             "roe":            roe,
-            "roic":           "[NO DATA]",   # requires manual balance-sheet calc
+            "roic":           "[NO DATA]",   # requires balance-sheet calculation
             "p_fcf":          p_fcf,
             "ttm_pe":         ttm_pe,
             "forward_pe":     fwd_pe,
             "margin":         margin,
             "debt_equity":    debt_eq,
             "rule_of_40":     rule40,
+            "_pe_source":     pe_source,     # internal — for console log only
         }
 
     fa_reports  = []
     fa_failures = []
 
     for r in matched:
-        yf_t = f"{r['symbol']}.SI"
-        print(f"    FA → {r['symbol']:<8} {r['name'][:35]:<35}", end=" ", flush=True)
+        yf_t     = f"{r['symbol']}.SI"
+        sgx_info = ticker_info.get(yf_t, {})
+        print(f"    FA → {r['symbol']:<8} {r['name'][:32]:<32}", end=" ", flush=True)
         try:
-            fa_data      = _fetch_fa_data(yf_t, r["name"])
-            screener     = GlobalScreenerV59_CN(r["symbol"], r["last_close"], fa_data)
-            report_path  = screener.save_report(output_dir=FA_REPORTS_DIR)
+            fa_data     = _fetch_fa_data(yf_t, r["name"], sgx_info)
+            pe_src      = fa_data.pop("_pe_source", "?")   # remove internal key before passing to screener
+            screener    = GlobalScreenerV59_CN(r["symbol"], r["last_close"], fa_data)
+            report_path = screener.save_report(output_dir=FA_REPORTS_DIR)
             fa_reports.append(report_path)
             _, verdict_label, _ = screener.get_verdict()
-            print(f"✅  {verdict_label}")
+            print(f"✅  {verdict_label}  [PE src: {pe_src}]")
         except Exception as e:
             fa_failures.append(r["symbol"])
             print(f"❌  {e}")
