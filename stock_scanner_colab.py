@@ -190,7 +190,7 @@ class GlobalScreenerV59_CN:
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;500;600&display=swap');
   *{{margin:0;padding:0;box-sizing:border-box}}
   body{{background:#f5f5f0;color:#1a1a2e;font-family:'Noto Sans SC',sans-serif;font-size:14px;line-height:1.6;padding:16px;overflow-x:hidden}}
-  .report{{width:100%;max-width:100%;display:flex;flex-direction:column;gap:12px}}
+  .report{{width:100%;max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:12px}}
   .header{{background:#fff;border:1px solid #d0d0d8;border-left:4px solid #0a7c5c;padding:14px 16px;box-shadow:0 1px 4px rgba(0,0,0,.06)}}
   .header-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}}
   .ticker{{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:600;color:#0a7c5c}}
