@@ -1,5 +1,5 @@
 # ============================================================
-# SGX STOCK SCANNER — Colab Ready
+# SGX STOCK SCANNER — Colab Ready  (fully self-contained)
 #
 # Sources:
 #   Ticker list : api.sgx.com  (SGX official API)
@@ -27,6 +27,9 @@
 #   1. Yahoo Finance (yfinance)  — primary, all fields
 #   2. SGX API                   — fallback for P/E, P/B, yield, EPS, mkt cap
 #
+# FA screener (GlobalScreenerV59_CN) is embedded below —
+#   no separate file required.
+#
 # Outputs:
 #   /content/sgx_scan_results.csv        full results for filtered stocks
 #   /content/sgx_watchlist.txt           TradingView watchlist (confirmed only)
@@ -38,7 +41,7 @@
 
 
 # ── Cell 2: Run Scanner ──────────────────────────────────────
-import csv, importlib.util, os, time, warnings
+import csv, os, re, time, warnings, webbrowser
 import numpy as np
 import pandas as pd
 import requests
@@ -53,9 +56,272 @@ FA_REPORTS_DIR   = "/content/fa_reports"
 BATCH_SIZE       = 50
 BENCHMARK        = "^STI"
 
-# Volume and price thresholds for pre-scan filter
 MIN_VOLUME = 100_000
 MIN_PRICE  = 0.20
+
+
+# ════════════════════════════════════════════════════════════
+# GLOBAL FA SCREENER v5.9  (embedded)
+# Original: Glaude Global_FA_Scan_CN_5_9 .py
+# ════════════════════════════════════════════════════════════
+SCREENER_VERSION = "5.9"
+
+CHANGELOG = [
+    ("5.9", "2026-05-06", "新增 HTML 报告；亮色背景 #f5f5f0；深色灰字 #555568；全中文标签；固定宽度纵向滚动；版本自动管理"),
+    ("5.8", "2026-04-01", "新增 Rule of 40；诚信修补（银行/REIT）；中文输出"),
+    ("5.6", "2026-03-01", "原始版本，纯文字 Markdown 输出"),
+]
+
+
+class GlobalScreenerV59_CN:
+    """GLOBAL Screener v5.9 — HTML 报告 + 版本自动管理"""
+
+    def __init__(self, ticker, price, data):
+        self.ticker = str(ticker).upper()
+        self.price = float(price)
+        self.data = data
+        self.version = SCREENER_VERSION
+        self.report_date = datetime.now().strftime("%Y年%m月%d日")
+
+        self.is_sg = (
+            self.ticker.isdigit()
+            or (self.ticker.isalnum() and any(c.isdigit() for c in self.ticker) and len(self.ticker) <= 4)
+        )
+        self.market = "SG" if self.is_sg else "US"
+        self.source = "SGX.com" if self.is_sg else "SEC EDGAR"
+
+        self.ng_count = 0
+        self.edge_count = 0
+        self.pass_count = 0
+        self._apply_honesty_patch()
+
+    def _apply_honesty_patch(self):
+        self.is_bank = self.data.get("is_bank", False)
+        if self.is_bank:
+            self.data["p_fcf"] = "[NO DATA]"
+            self.data["roic"]  = "[NO DATA]"
+
+    def _check(self, name, value, sg_spec, us_spec, condition, ref_only=False):
+        spec = sg_spec if self.market == "SG" else us_spec
+        spec_label = str(spec) if spec is not None else "参考"
+
+        if ref_only:
+            return {"name": name, "value": str(value), "spec": "参考", "status": "ref", "label": "—"}
+        if value == "[NO DATA]":
+            return {"name": name, "value": "[无数据]", "spec": spec_label, "status": "nd", "label": "—"}
+        try:
+            passed = condition(float(value), spec)
+            if passed:
+                try:
+                    edge = not condition(float(value) * 0.9, spec)
+                except Exception:
+                    edge = False
+                if edge:
+                    self.edge_count += 1
+                    return {"name": name, "value": str(value), "spec": spec_label, "status": "warn", "label": "⚠️"}
+                else:
+                    self.pass_count += 1
+                    return {"name": name, "value": str(value), "spec": spec_label, "status": "pass", "label": "✅"}
+            else:
+                self.ng_count += 1
+                return {"name": name, "value": str(value), "spec": spec_label, "status": "fail", "label": "❌"}
+        except Exception:
+            return {"name": name, "value": str(value), "spec": spec_label, "status": "nd", "label": "⚠️"}
+
+    def run_matrix(self):
+        d = self.data
+        return [
+            self._check("EPS 同比增长 (%)",    d.get("eps_growth",  "[NO DATA]"), 0,    10,   lambda v, s: v >= s),
+            self._check("营收增速 / CAGR (%)", d.get("rev_cagr",    "[NO DATA]"), 10,   10,   lambda v, s: v > s),
+            self._check("ROE (TTM) (%)",       d.get("roe",         "[NO DATA]"), 9,    15,   lambda v, s: v > s),
+            self._check("ROIC (%)",            d.get("roic",        "[NO DATA]"), 15,   15,   lambda v, s: v >= s),
+            self._check("P/FCF (估值倍数)",    d.get("p_fcf",       "[NO DATA]"), 35,   25,   lambda v, s: v < s),
+            self._check("TTM 市盈率",          d.get("ttm_pe",      "—"),         None, None, None, ref_only=True),
+            self._check("前瞻市盈率",          d.get("forward_pe",  "—"),         None, None, None, ref_only=True),
+            self._check("净利润率 (%)",        d.get("margin",      "[NO DATA]"), 5,    9.5,  lambda v, s: v > s),
+            self._check("债务权益比",          d.get("debt_equity", "[NO DATA]"), 1.0,  1.0,  lambda v, s: v < s),
+            self._check("Rule of 40 (%)",      d.get("rule_of_40",  "[NO DATA]"), 40,   40,   lambda v, s: v > s),
+        ]
+
+    def get_verdict(self):
+        if self.ng_count == 0:
+            return "fire",  "🔥 FIRE — 符合买入标准", "fire"
+        elif self.ng_count <= 2:
+            return "wait",  "⏳ WAIT — 建议观望",     "wait"
+        else:
+            return "avoid", "🚫 AVOID — 规避风险",    "avoid"
+
+    def _changelog_html(self):
+        rows = ""
+        for ver, date, note in CHANGELOG:
+            is_cur = ver == self.version
+            b0 = "<strong>" if is_cur else ""
+            b1 = "</strong>" if is_cur else ""
+            cur = " (当前)" if is_cur else ""
+            rows += f"<tr><td>{b0}v{ver}{cur}{b1}</td><td>{date}</td><td>{note}</td></tr>"
+        return rows
+
+    def generate_html(self):
+        matrix = self.run_matrix()
+        verdict_key, verdict_label, verdict_css = self.get_verdict()
+        total_valid = self.pass_count + self.edge_count + self.ng_count
+        score_pct = int(self.pass_count / total_valid * 100) if total_valid > 0 else 0
+        d = self.data
+        currency = "S$" if self.is_sg else "US$"
+        mkt = "SG" if self.is_sg else "US"
+
+        matrix_rows_html = ""
+        for i, row in enumerate(matrix, 1):
+            sc = {"pass": "pass", "warn": "warn", "fail": "fail", "ref": "nd", "nd": "nd"}.get(row["status"], "nd")
+            matrix_rows_html += (
+                f'<div class="matrix-row">'
+                f'<div class="col-num">{i}</div>'
+                f'<div class="col-name">{row["name"]}</div>'
+                f'<div class="col-val">{row["value"]}</div>'
+                f'<div class="col-std">{row["spec"]}</div>'
+                f'<div class="col-stat {sc}">{row["label"]}</div>'
+                f'</div>'
+            )
+
+        vc = {"fire":  ("rgba(10,124,92,0.06)",  "#a0d4c4", "#0a7c5c"),
+              "wait":  ("rgba(245,166,35,0.05)",  "#e8c070", "#b87000"),
+              "avoid": ("rgba(204,34,68,0.05)",   "#f0a0b0", "#cc2244")}
+        bc = {"fire":  ("rgba(10,124,92,0.12)",  "#0a7c5c", "#0a7c5c"),
+              "wait":  ("rgba(245,166,35,0.12)", "#e8960a", "#b87000"),
+              "avoid": ("rgba(204,34,68,0.12)", "#cc2244", "#cc2244")}
+        v_bg, v_border, v_color = vc[verdict_css]
+        b_bg, b_border, b_color = bc[verdict_css]
+        entry_html = f'<div class="entry-box">🎯 {d["entry_note"]}</div>' if d.get("entry_note") else ""
+        changelog_rows = self._changelog_html()
+
+        css = f"""
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;500;600&display=swap');
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{background:#f5f5f0;color:#1a1a2e;font-family:'Noto Sans SC',sans-serif;font-size:14px;line-height:1.6;padding:16px;overflow-x:hidden}}
+  .report{{width:100%;max-width:100%;display:flex;flex-direction:column;gap:12px}}
+  .header{{background:#fff;border:1px solid #d0d0d8;border-left:4px solid #0a7c5c;padding:14px 16px;box-shadow:0 1px 4px rgba(0,0,0,.06)}}
+  .header-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}}
+  .ticker{{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:600;color:#0a7c5c}}
+  .ticker span{{color:#555568;font-size:15px;font-weight:400;margin-left:6px}}
+  .company-name{{font-size:12px;color:#555568;margin-top:3px}}
+  .verdict-badge{{font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:600;padding:5px 14px;background:{b_bg};border:1px solid {b_border};color:{b_color};white-space:nowrap;flex-shrink:0}}
+  .filing-info{{margin-top:6px;font-size:11px;color:#555568}}
+  .section-label{{font-family:'IBM Plex Mono',monospace;font-size:10px;color:#555568;letter-spacing:2px;text-transform:uppercase}}
+  .stats-grid{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}
+  .stat-card{{background:#fff;border:1px solid #d8d8e0;padding:10px 12px;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+  .stat-label{{font-size:10px;color:#555568;text-transform:uppercase;letter-spacing:1px;margin-bottom:2px}}
+  .stat-value{{font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600;color:#1a1a2e}}
+  .stat-sub{{font-size:11px;color:#555568;margin-top:2px}}
+  .matrix{{background:#fff;border:1px solid #d8d8e0;width:100%;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+  .matrix-row{{display:grid;grid-template-columns:26px 1fr auto auto 38px;border-bottom:1px solid #eeeef4;align-items:center}}
+  .matrix-row:last-child{{border-bottom:none}}
+  .matrix-row.hdr{{background:#f0f0f6;font-family:'IBM Plex Mono',monospace;font-size:10px;color:#555568;letter-spacing:1px;text-transform:uppercase}}
+  .matrix-row>div{{padding:9px 8px;border-right:1px solid #eeeef4}}
+  .matrix-row>div:last-child{{border-right:none}}
+  .col-num{{text-align:center;color:#666678;font-family:'IBM Plex Mono',monospace;font-size:11px}}
+  .col-name{{color:#1a1a2e;font-size:13px}}
+  .col-val{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#333350;text-align:right;white-space:nowrap}}
+  .col-std{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#555568;text-align:right;white-space:nowrap}}
+  .col-stat{{text-align:center;font-size:15px}}
+  .pass{{color:#0a7c5c}}.warn{{color:#b87000}}.fail{{color:#cc2244}}.nd{{color:#666678;font-size:12px}}
+  .score-wrap{{background:#fff;border:1px solid #d8d8e0;padding:10px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+  .score-num{{font-family:'IBM Plex Mono',monospace;font-size:16px;font-weight:600;color:#0a7c5c;white-space:nowrap}}
+  .score-track{{flex:1;min-width:60px;height:5px;background:#e0e0e8;border-radius:3px}}
+  .score-fill{{height:100%;width:{score_pct}%;background:#0a7c5c;border-radius:3px}}
+  .tags{{display:flex;gap:6px;flex-wrap:wrap}}
+  .tag{{font-family:'IBM Plex Mono',monospace;font-size:11px;padding:2px 8px;border-radius:2px}}
+  .tag-g{{background:#e8f6f1;color:#0a7c5c;border:1px solid #a0d4c4}}
+  .tag-y{{background:#fff5e0;color:#b87000;border:1px solid #e8c070}}
+  .tag-r{{background:#ffeef2;color:#cc2244;border:1px solid #f0a0b0}}
+  .phase2{{background:#fff;border:1px solid #d8d8e0;padding:12px 14px;display:flex;flex-direction:column;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+  .p2-block{{padding:10px 0;border-bottom:1px solid #eeeef4}}
+  .p2-block:last-child{{border-bottom:none;padding-bottom:0}}
+  .p2-block:first-child{{padding-top:0}}
+  .p2-key{{font-family:'IBM Plex Mono',monospace;font-size:10px;color:#555568;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:5px}}
+  .p2-val{{font-size:13px;color:#2a2a40;line-height:1.65}}
+  .p2-val strong{{color:#1a1a2e}}
+  .verdict{{background:{v_bg};border:1px solid {v_border};padding:14px 16px}}
+  .verdict-title{{font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600;color:{v_color};margin-bottom:8px}}
+  .verdict-body{{font-size:13px;color:#2a2a40;line-height:1.7}}
+  .verdict-body strong{{color:#1a1a2e}}
+  .entry-box{{margin-top:10px;padding:8px 12px;background:#e8f6f1;border-left:3px solid #0a7c5c;font-family:'IBM Plex Mono',monospace;font-size:13px;color:#0a7c5c}}
+  .changelog{{background:#fff;border:1px solid #d8d8e0;padding:12px 14px;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+  .changelog table{{width:100%;border-collapse:collapse;font-size:12px}}
+  .changelog th{{background:#f0f0f6;color:#555568;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;padding:6px 8px;text-align:left;border-bottom:1px solid #d8d8e0}}
+  .changelog td{{padding:6px 8px;border-bottom:1px solid #eeeef4;color:#2a2a40;vertical-align:top}}
+  .changelog tr:last-child td{{border-bottom:none}}
+  .changelog td:first-child{{font-family:'IBM Plex Mono',monospace;color:#0a7c5c;white-space:nowrap}}
+  .changelog td:nth-child(2){{white-space:nowrap;color:#555568}}
+  .footer{{font-size:10px;color:#888898;text-align:right;padding-top:4px}}
+"""
+        return f"""<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{self.ticker} FA Scan v{self.version}</title>
+<style>{css}</style></head><body>
+<div class="report">
+<div class="header"><div class="header-top"><div>
+<div class="ticker">{self.ticker} <span>@ {currency}{self.price}</span></div>
+<div class="company-name">{d.get("company_name", self.ticker)} · {self.market} ({self.source})</div>
+</div><div class="verdict-badge">{verdict_label}</div></div>
+<div class="filing-info">最新财报：{d.get("releasing_date","未提供")} · 报告生成：{self.report_date} · Screener v{self.version}</div></div>
+
+<div class="section-label">关键数据</div>
+<div class="stats-grid">
+<div class="stat-card"><div class="stat-label">TTM 市盈率</div><div class="stat-value">{d.get("ttm_pe","—")}</div><div class="stat-sub">前瞻PE：{d.get("forward_pe","—")}</div></div>
+<div class="stat-card"><div class="stat-label">ROE / ROIC</div><div class="stat-value">{d.get("roe","—")}% / {d.get("roic","—")}%</div><div class="stat-sub">净利润率：{d.get("margin","—")}%</div></div>
+<div class="stat-card"><div class="stat-label">P/FCF</div><div class="stat-value">{d.get("p_fcf","—")}</div><div class="stat-sub">债务权益比：{d.get("debt_equity","—")}x</div></div>
+<div class="stat-card"><div class="stat-label">EPS增长 / 营收CAGR</div><div class="stat-value">{d.get("eps_growth","—")}% / {d.get("rev_cagr","—")}%</div><div class="stat-sub">Rule of 40：{d.get("rule_of_40","—")}%</div></div>
+</div>
+
+<div class="section-label">第一阶段 — 财务矩阵 (v{self.version})</div>
+<div class="matrix">
+<div class="matrix-row hdr"><div class="col-num">#</div><div>指标</div><div style="text-align:right">实际值</div><div style="text-align:right">{mkt} 标准</div><div style="text-align:center">状态</div></div>
+{matrix_rows_html}
+</div>
+
+<div class="score-wrap">
+<div class="score-num">矩阵评分：{self.pass_count + self.edge_count} / {total_valid}</div>
+<div class="score-track"><div class="score-fill"></div></div>
+<div class="tags"><span class="tag tag-g">✅ ×{self.pass_count} 达标</span><span class="tag tag-y">⚠️ ×{self.edge_count} 边缘</span><span class="tag tag-r">❌ ×{self.ng_count} 未达</span></div>
+</div>
+
+<div class="section-label">第二阶段 — 深度研究</div>
+<div class="phase2">
+<div class="p2-block"><div class="p2-key">增长动能分析</div><div class="p2-val">{d.get("momentum_analysis","无数据")}</div></div>
+<div class="p2-block"><div class="p2-key">竞争格局与护城河</div><div class="p2-val">{d.get("moat_analysis","无数据")}</div></div>
+<div class="p2-block"><div class="p2-key">前瞻市盈率审计</div><div class="p2-val">{d.get("fpe_audit","无数据")}</div></div>
+<div class="p2-block"><div class="p2-key">周期性风险评估</div><div class="p2-val">{d.get("cyclicality_audit","无数据")}</div></div>
+</div>
+
+<div class="verdict">
+<div class="verdict-title">{verdict_label}</div>
+<div class="verdict-body">触发 <strong>{self.ng_count} 个「❌ 未达标」</strong>警报，{self.edge_count} 个「⚠️ 边缘」指标。{d.get("final_comment","请结合第二阶段深度研究综合评估。")}</div>
+{entry_html}
+</div>
+
+<div class="section-label">版本历史</div>
+<div class="changelog"><table>
+<tr><th>版本</th><th>日期</th><th>更新内容</th></tr>
+{changelog_rows}
+</table></div>
+
+<div class="footer">GLOBAL Screener v{self.version} · {self.report_date} · 仅供参考，不构成投资建议</div>
+</div></body></html>"""
+
+    def save_report(self, output_dir="."):
+        html = self.generate_html()
+        ts = datetime.now().strftime("%Y%m%d")
+        filepath = os.path.join(output_dir, f"{self.ticker}_FA_v{self.version}_{ts}.html")
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"✅ HTML 报告已保存：{filepath}")
+        return filepath
+
+    def open_report(self, output_dir="."):
+        filepath = self.save_report(output_dir)
+        webbrowser.open(f"file://{os.path.abspath(filepath)}")
+        return filepath
 
 
 # ════════════════════════════════════════════════════════════
@@ -169,23 +435,18 @@ def add_breakout_buy_signals(
 # ════════════════════════════════════════════════════════════
 # SCANNER 3 — OBV (used for sell_ban state only)
 # sell_ban is ON when OBV long SMA slope > 0
-# (volume accumulation still rising — bullish confirmation)
 # ════════════════════════════════════════════════════════════
 def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1.0):
     out = df.copy()
     close, volume = out["close"], out["volume"]
     dv = np.where(close > close.shift(1), volume,
                   np.where(close < close.shift(1), -volume, 0))
-    out["obv"]           = pd.Series(dv, index=out.index).cumsum()
-    out["obv_short_sma"] = _sma(out["obv"], short_sma_length)
-    out["obv_long_sma"]  = _sma(out["obv"], long_sma_length)
+    out["obv"]            = pd.Series(dv, index=out.index).cumsum()
+    out["obv_short_sma"]  = _sma(out["obv"], short_sma_length)
+    out["obv_long_sma"]   = _sma(out["obv"], long_sma_length)
     out["long_sma_slope"] = out["obv_long_sma"] - out["obv_long_sma"].shift(1)
-
-    # sell_ban: True when long OBV SMA is still rising (bullish volume trend)
-    out["sell_ban"] = out["long_sma_slope"] > 0
-    # buy_ban:  True when long OBV SMA is falling (bearish volume trend)
-    out["buy_ban"]  = out["long_sma_slope"] < 0
-
+    out["sell_ban"]       = out["long_sma_slope"] > 0
+    out["buy_ban"]        = out["long_sma_slope"] < 0
     out["obv_above_both"] = (out["obv"] > out["obv_short_sma"]) & (out["obv"] > out["obv_long_sma"])
     out["obv_below_both"] = (out["obv"] < out["obv_short_sma"]) & (out["obv"] < out["obv_long_sma"])
 
@@ -230,8 +491,6 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
 
 # ════════════════════════════════════════════════════════════
 # STEP 1 — Fetch SGX stock list
-# Extended fields (pe, pb, yld, eps, mc) are stored here and
-# used as FA fallback in Step 5 when Yahoo Finance is empty.
 # ════════════════════════════════════════════════════════════
 print("=" * 55)
 print("  SGX STOCK SCANNER")
@@ -250,12 +509,11 @@ ticker_info = {
         "symbol": s["nc"],
         "name":   s.get("n", ""),
         "market": s.get("m", ""),
-        # SGX API FA fields — fallback when Yahoo Finance unavailable
-        "sgx_pe":  s.get("pe"),                      # trailing P/E
-        "sgx_pb":  s.get("pb"),                      # P/B ratio
-        "sgx_yld": s.get("yld") or s.get("dy"),      # dividend yield %
-        "sgx_eps": s.get("eps") or s.get("es"),      # EPS (S$)
-        "sgx_mc":  s.get("mc")  or s.get("mktcap"),  # market cap
+        "sgx_pe":  s.get("pe"),
+        "sgx_pb":  s.get("pb"),
+        "sgx_yld": s.get("yld") or s.get("dy"),
+        "sgx_eps": s.get("eps") or s.get("es"),
+        "sgx_mc":  s.get("mc")  or s.get("mktcap"),
     }
     for s in stocks if s.get("nc")
 }
@@ -303,7 +561,6 @@ print(f"    Total stocks with data: {len(stock_data)}")
 
 # ════════════════════════════════════════════════════════════
 # STEP 2b — Filter: volume > 100,000 AND price > 0.20
-# Only qualified stocks proceed to scanning.
 # ════════════════════════════════════════════════════════════
 print(f"\n[2b/5] Applying filters  (volume > {MIN_VOLUME:,}  AND  price > {MIN_PRICE})...")
 
@@ -321,12 +578,12 @@ stock_data = filtered_data
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 3 — Run scanners on filtered tickers, check last bar
+# STEP 3 — Run scanners on filtered tickers
 # ════════════════════════════════════════════════════════════
 print(f"\n[3/5] Running scanners on {len(stock_data)} filtered stocks...")
 
 results  = []
-min_bars = 110   # OBV long SMA needs 100 bars minimum
+min_bars = 110
 
 for idx, (yf_t, df) in enumerate(stock_data.items()):
     if len(df) < min_bars:
@@ -339,10 +596,8 @@ for idx, (yf_t, df) in enumerate(stock_data.items()):
 
         sma_sig      = bool(df_sma["buy_signal"].iloc[-1])
         bo_sig       = bool(df_bo["any_buy_signal"].iloc[-1])
-        obv_sell_ban = bool(df_obv["sell_ban"].iloc[-1])   # OBV long SMA slope > 0
-
-        # Signal TRUE if (sma_gap AND obv sell_ban) OR (breakout AND obv sell_ban)
-        confirmed = (sma_sig and obv_sell_ban) or (bo_sig and obv_sell_ban)
+        obv_sell_ban = bool(df_obv["sell_ban"].iloc[-1])
+        confirmed    = (sma_sig and obv_sell_ban) or (bo_sig and obv_sell_ban)
 
         results.append({
             "symbol":           info["symbol"],
@@ -407,35 +662,18 @@ print("=" * 60)
 # STEP 5 — FA Scan: run GlobalScreenerV59_CN on each
 #          confirmed stock and export an HTML report.
 #
-# Requires: "Glaude Global_FA_Scan_CN_5_9 .py" in the same
-#           directory as this script.
-#
 # FA data priority:
 #   1. Yahoo Finance (yfinance) — all fields attempted first
-#   2. SGX API                  — fallback for fields that
-#      Yahoo Finance could not provide (P/E, P/B, yield, EPS)
+#   2. SGX API                  — fallback for P/E, P/B, yield, EPS
 # ════════════════════════════════════════════════════════════
 print(f"\n[5/5] Running FA scan on {len(matched)} confirmed stocks...")
 
-_fa_filename = "Glaude Global_FA_Scan_CN_5_9 .py"
-_fa_path     = os.path.join(os.getcwd(), _fa_filename)
-
 if not matched:
     print("    No confirmed signals — FA scan skipped.")
-elif not os.path.exists(_fa_path):
-    print(f"    WARNING: FA scan file not found at:\n      {_fa_path}")
-    print(f"    Ensure '{_fa_filename}' is in the same directory.")
 else:
-    # Dynamically load GlobalScreenerV59_CN from the FA scan file
-    _spec = importlib.util.spec_from_file_location("fa_scan", _fa_path)
-    _fa_mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_fa_mod)
-    GlobalScreenerV59_CN = _fa_mod.GlobalScreenerV59_CN
-
     os.makedirs(FA_REPORTS_DIR, exist_ok=True)
 
     def _sgx_float(sgx_info, key):
-        """Safely parse an SGX API value (may be string, '--', None) to float."""
         v = sgx_info.get(key)
         try:
             f = float(v)
@@ -444,15 +682,6 @@ else:
             return None
 
     def _fetch_fa_data(yf_ticker, fallback_name, sgx_info):
-        """
-        Fetch FA fundamentals for one stock.
-
-        Priority order per field:
-          1. Yahoo Finance (yfinance .info dict)
-          2. SGX API data already captured in Step 1
-          3. [NO DATA] — handled gracefully by the screener
-        """
-        # ── 1. Yahoo Finance ────────────────────────────────
         try:
             yf_info = yf.Ticker(yf_ticker).info
             if not yf_info or yf_info.get("regularMarketPrice") is None:
@@ -460,30 +689,15 @@ else:
         except Exception:
             yf_info = {}
 
-        # ── 2. SGX API fallback values ───────────────────────
-        sgx_pe  = _sgx_float(sgx_info, "sgx_pe")
-        sgx_pb  = _sgx_float(sgx_info, "sgx_pb")   # not used in screener yet, stored for reference
-        sgx_eps = _sgx_float(sgx_info, "sgx_eps")  # S$ EPS — used to flag data availability
+        sgx_pe = _sgx_float(sgx_info, "sgx_pe")
 
-        # ── Helper converters ────────────────────────────────
-        def _pct(v):
-            return round(v * 100, 2) if v is not None else "[NO DATA]"
+        def _pct(v): return round(v * 100, 2) if v is not None else "[NO DATA]"
+        def _num(v): return round(v, 2)        if v is not None else "[NO DATA]"
+        def _pe(v):  return round(v, 2)        if v is not None else "—"
 
-        def _num(v, dp=2):
-            return round(v, dp) if v is not None else "[NO DATA]"
-
-        def _pe(v):
-            return round(v, 2) if v is not None else "—"
-
-        # ── Field mapping (Yahoo first, SGX fallback) ────────
-        # P/E: Yahoo trailingPE → SGX pe
-        yf_pe  = yf_info.get("trailingPE")
-        ttm_pe = _pe(yf_pe if yf_pe is not None else sgx_pe)
-
-        # Forward P/E: Yahoo only
-        fwd_pe = _pe(yf_info.get("forwardPE"))
-
-        # Profitability & growth: Yahoo only
+        yf_pe      = yf_info.get("trailingPE")
+        ttm_pe     = _pe(yf_pe if yf_pe is not None else sgx_pe)
+        fwd_pe     = _pe(yf_info.get("forwardPE"))
         roe        = _pct(yf_info.get("returnOnEquity"))
         margin     = _pct(yf_info.get("profitMargins"))
         rev_cagr   = _pct(yf_info.get("revenueGrowth"))
@@ -492,44 +706,29 @@ else:
         de_raw     = yf_info.get("debtToEquity")
         debt_eq    = round(de_raw / 100, 2) if de_raw is not None else "[NO DATA]"
         p_fcf      = _num(yf_info.get("priceToFreeCashflows"))
-
-        # Rule of 40 = revenue growth % + net margin %
-        rule40 = "[NO DATA]"
-        if isinstance(rev_cagr, float) and isinstance(margin, float):
-            rule40 = round(rev_cagr + margin, 2)
-
-        # Most recent quarter date
-        mrq      = yf_info.get("mostRecentQuarter")
-        rel_date = datetime.fromtimestamp(mrq).strftime("%Y-%m-%d") if mrq else "N/A"
-
-        # Bank / REIT detection
-        sector   = yf_info.get("sector", "")
-        industry = yf_info.get("industry", "")
-        is_bank  = any(k in (sector + industry).lower()
-                       for k in ["bank", "financ", "reit", "trust", "insur"])
-
-        # Company name: Yahoo → SGX name field → fallback
-        company_name = (yf_info.get("longName") or yf_info.get("shortName")
-                        or sgx_info.get("name") or fallback_name)
-
-        # Log which source was used for P/E
-        pe_source = "Yahoo" if yf_pe is not None else ("SGX" if sgx_pe is not None else "N/A")
+        rule40     = round(rev_cagr + margin, 2) if isinstance(rev_cagr, float) and isinstance(margin, float) else "[NO DATA]"
+        mrq        = yf_info.get("mostRecentQuarter")
+        rel_date   = datetime.fromtimestamp(mrq).strftime("%Y-%m-%d") if mrq else "N/A"
+        sector     = yf_info.get("sector", "")
+        industry   = yf_info.get("industry", "")
+        is_bank    = any(k in (sector + industry).lower() for k in ["bank", "financ", "reit", "trust", "insur"])
+        pe_source  = "Yahoo" if yf_pe is not None else ("SGX" if sgx_pe is not None else "N/A")
 
         return {
-            "company_name":   company_name,
+            "company_name":   yf_info.get("longName") or yf_info.get("shortName") or sgx_info.get("name") or fallback_name,
             "releasing_date": rel_date,
             "is_bank":        is_bank,
             "eps_growth":     eps_growth,
             "rev_cagr":       rev_cagr,
             "roe":            roe,
-            "roic":           "[NO DATA]",   # requires balance-sheet calculation
+            "roic":           "[NO DATA]",
             "p_fcf":          p_fcf,
             "ttm_pe":         ttm_pe,
             "forward_pe":     fwd_pe,
             "margin":         margin,
             "debt_equity":    debt_eq,
             "rule_of_40":     rule40,
-            "_pe_source":     pe_source,     # internal — for console log only
+            "_pe_source":     pe_source,
         }
 
     fa_reports  = []
@@ -541,7 +740,7 @@ else:
         print(f"    FA → {r['symbol']:<8} {r['name'][:32]:<32}", end=" ", flush=True)
         try:
             fa_data     = _fetch_fa_data(yf_t, r["name"], sgx_info)
-            pe_src      = fa_data.pop("_pe_source", "?")   # remove internal key before passing to screener
+            pe_src      = fa_data.pop("_pe_source", "?")
             screener    = GlobalScreenerV59_CN(r["symbol"], r["last_close"], fa_data)
             report_path = screener.save_report(output_dir=FA_REPORTS_DIR)
             fa_reports.append(report_path)
@@ -550,7 +749,7 @@ else:
         except Exception as e:
             fa_failures.append(r["symbol"])
             print(f"❌  {e}")
-        time.sleep(0.5)   # be polite to Yahoo Finance
+        time.sleep(0.5)
 
     print(f"\n    FA reports saved  → {FA_REPORTS_DIR}/")
     print(f"    Reports generated : {len(fa_reports)}")
