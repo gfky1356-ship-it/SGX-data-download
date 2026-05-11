@@ -1,0 +1,84 @@
+import yfinance as yf
+import pandas as pd
+
+def scan_relative_strength(tickers, benchmark='SPY', ma_period=20):
+    """
+    扫描相对强度(RS) Delta为正且高于其移动平均线的股票。
+    """
+    all_tickers = tickers + [benchmark]
+    print(f"正在下载数据，涵盖 {len(all_tickers)} 个标的（包含基准指数 {benchmark}）...")
+    
+    # 批量下载过去 6 个月的收盘价数据
+    # 对于新加坡股票（如 iFAST），Yahoo Finance 的代码通常带有 .SI 后缀 (例如 AIY.SI)
+    data = yf.download(all_tickers, period="6mo", progress=False)['Close']
+    
+    if benchmark not in data.columns:
+        print(f"无法获取基准指数 {benchmark} 的数据。")
+        return pd.DataFrame()
+
+    benchmark_data = data[benchmark]
+    flagged_stocks = []
+
+    for ticker in tickers:
+        if ticker not in data.columns or data[ticker].isna().all():
+            print(f"跳过 {ticker}: 无法获取有效数据。")
+            continue
+
+        stock_data = data[ticker]
+
+        # 1. 计算个股相对于大盘的强度 (RS)
+        rs = stock_data / benchmark_data
+
+        # 2. 计算 RS 的移动平均线 (SMA)
+        rs_ma = rs.rolling(window=ma_period).mean()
+
+        # 3. 计算 RS 的 Delta (当前周期 RS - 上一个周期 RS)
+        rs_delta = rs.diff()
+
+        # 获取最新一个交易日的数据
+        latest_rs = rs.iloc[-1]
+        latest_rs_ma = rs_ma.iloc[-1]
+        latest_rs_delta = rs_delta.iloc[-1]
+
+        # 检查是否包含 NaN 值 (例如刚上市的股票数据不足)
+        if pd.isna(latest_rs) or pd.isna(latest_rs_ma) or pd.isna(latest_rs_delta):
+            continue
+
+        # 4. 核心判定逻辑：Delta > 0 且 RS > RS的移动平均线
+        if (latest_rs_delta > 0) and (latest_rs > latest_rs_ma):
+            flagged_stocks.append({
+                'Ticker': ticker,
+                'RS_Value': round(latest_rs, 4),
+                'RS_MA_20': round(latest_rs_ma, 4),
+                'RS_Delta': round(latest_rs_delta, 6)
+            })
+
+    # 将结果转换为 DataFrame 方便阅读和导出
+    result_df = pd.DataFrame(flagged_stocks)
+    
+    # 按照 RS_Delta 降序排列，Delta 越大说明相对大盘拉升越猛
+    if not result_df.empty:
+        result_df = result_df.sort_values(by='RS_Delta', ascending=False).reset_index(drop=True)
+        
+    return result_df
+
+# ==========================================
+# 运行示例
+# ==========================================
+if __name__ == "__main__":
+    # 定义你要扫描的股票池 (美股和新加坡股等)
+    # 提示：使用 Yahoo Finance 数据源时，新加坡股票需添加 .SI 后缀
+    my_watchlist = [
+        'AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 
+        'PLTR', 'AMD', 'AIY.SI', 'D05.SI'
+    ]
+    
+    # 运行扫描器 (默认对比标的为 SPY，计算 20 日均线)
+    print("开始执行扫描策略...")
+    matched_stocks = scan_relative_strength(tickers=my_watchlist, benchmark='SPY', ma_period=20)
+    
+    if not matched_stocks.empty:
+        print("\n✅ 匹配成功的强势股列表:")
+        print(matched_stocks.to_string())
+    else:
+        print("\n❌ 当前没有股票符合 'Delta为正 且 RS > MA' 的条件。")
