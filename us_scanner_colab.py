@@ -414,6 +414,22 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
     out["sell_signal"] = sell_signal
     return out
 
+_TV_EXCHANGE_MAP = {
+    "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ",
+    "NasdaqGS": "NASDAQ", "NasdaqGM": "NASDAQ", "NasdaqCM": "NASDAQ",
+    "NYQ": "NYSE", "PCX": "NYSE", "NYSEArca": "NYSE", "ASE": "NYSE",
+}
+
+def get_tv_ticker(symbol):
+    """Return 'NASDAQ:SYMBOL' or 'NYSE:SYMBOL'; falls back to plain symbol on error."""
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        ex = fi.exchange if hasattr(fi, "exchange") else ""
+        tv_ex = _TV_EXCHANGE_MAP.get(ex, "")
+        return f"{tv_ex}:{symbol}" if tv_ex else symbol
+    except Exception:
+        return symbol
+
 def save_benchmark_to_csv(close_series, name, directory):
     safe_name = name.replace("^", "")
     path = os.path.join(directory, f"{safe_name}.csv")
@@ -611,6 +627,10 @@ print(f"\n    Done: {len(results)} scanned, {len(matched)} confirmed signals")
 
 # Step 4: Export
 print(f"\n[4/5] Exporting results...")
+# Resolve correct TradingView exchange prefix (NASDAQ: vs NYSE:) for each confirmed stock
+print(f"    Resolving TradingView exchange prefixes for {len(matched)} confirmed stocks...")
+for r in matched:
+    r["tv_ticker"] = get_tv_ticker(r["symbol"])
 fieldnames  = ["symbol","name","sector","signal_confirmed","sma_gap_buy","breakout_buy",
                "obv_sell_ban","last_close","last_date","bars","rsi14","index_rsi14","rsi_ratio"]
 rsi_fields  = ["tv_ticker","symbol","name","rsi14","index_rsi14","rsi_ratio","index_ticker","last_date"]
@@ -621,13 +641,13 @@ with open(OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
 print(f"    Full results  → {OUTPUT_RESULTS}")
 
 with open(OUTPUT_WATCHLIST, "w", encoding="utf-8") as f:
-    for r in matched: f.write(f"{r['symbol']}\n")
+    for r in matched: f.write(f"{r['tv_ticker']}\n")
 print(f"    TV watchlist  → {OUTPUT_WATCHLIST}  ({len(matched)} tickers)")
 
 with open(OUTPUT_RSI, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=rsi_fields); w.writeheader()
     for r in matched:
-        w.writerow({"tv_ticker": r["symbol"], "symbol": r["symbol"], "name": r["name"],
+        w.writerow({"tv_ticker": r["tv_ticker"], "symbol": r["symbol"], "name": r["name"],
                     "rsi14": r["rsi14"], "index_rsi14": r["index_rsi14"], "rsi_ratio": r["rsi_ratio"],
                     "index_ticker": "SPY", "last_date": r["last_date"]})
 print(f"    RSI comparison → {OUTPUT_RSI}")
