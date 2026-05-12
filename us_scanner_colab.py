@@ -1,10 +1,19 @@
 # ============================================================
 # US STOCK SCANNER (S&P 500) — Colab Ready  (v7.0, US only)
 #
-# ── Quick Start ─────────────────────────────────────────────
-#   !wget -qO us_scanner_colab.py https://raw.githubusercontent.com/gfky1356-ship-it/SGX-data-download/main/us_scanner_colab.py \
-#     && pip install yfinance requests weasyprint pypdf -q
-#   !python us_scanner_colab.py
+# ── Quick Start (3 Colab cells) ─────────────────────────────
+#
+#   Cell 1 — Mount Google Drive (run once, approve the popup):
+#     from google.colab import drive
+#     drive.mount('/content/drive')
+#
+#   Cell 2 — Download script:
+#     !wget -qO us_scanner_colab.py https://raw.githubusercontent.com/gfky1356-ship-it/SGX-data-download/main/us_scanner_colab.py \
+#       && pip install yfinance requests weasyprint pypdf -q
+#
+#   Cell 3 — Run:
+#     !python us_scanner_colab.py
+#
 # ─────────────────────────────────────────────────────────────
 #
 # Market    : United States  (S&P 500)
@@ -36,15 +45,24 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore")
 
-# ── Google Drive (auto-mount in Colab, fallback to /content) ─
-try:
-    from google.colab import drive
-    drive.mount("/content/drive", force_remount=False)
+# ── Google Drive ─────────────────────────────────────────────
+# Drive must be mounted in a separate Colab cell BEFORE running
+# this script (drive.mount() cannot run inside a subprocess).
+# If already mounted, we just detect the path automatically.
+if os.path.isdir("/content/drive/MyDrive"):
     GDRIVE_BASE = "/content/drive/MyDrive/StockScanner"
-    print(f"✅ Google Drive mounted → {GDRIVE_BASE}")
-except Exception:
-    GDRIVE_BASE = "/content"
-    print("ℹ️  Google Drive not available — saving to /content")
+    print(f"✅ Google Drive detected → {GDRIVE_BASE}")
+else:
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive", force_remount=False)
+        GDRIVE_BASE = "/content/drive/MyDrive/StockScanner"
+        print(f"✅ Google Drive mounted → {GDRIVE_BASE}")
+    except Exception:
+        GDRIVE_BASE = "/content"
+        print("⚠️  Google Drive not mounted — saving to /content instead.\n"
+              "    To save to Drive: run  from google.colab import drive; drive.mount('/content/drive')\n"
+              "    in a separate cell first, then re-run this script.")
 
 os.makedirs(GDRIVE_BASE, exist_ok=True)
 BENCHMARK_DATA_DIR = os.path.join(GDRIVE_BASE, "benchmark_data")
