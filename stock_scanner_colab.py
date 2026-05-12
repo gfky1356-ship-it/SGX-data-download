@@ -1,13 +1,15 @@
 # ============================================================
-# SGX + US STOCK SCANNER — Colab Ready  (fully self-contained)
+# SGX + US STOCK SCANNER — Colab Ready  (v7.0, fully self-contained)
 #
 # ── Quick Start (paste into Google Colab) ───────────────────
 # Private repo (replace YOUR_TOKEN with your GitHub PAT):
-#   !git clone -q https://YOUR_TOKEN@github.com/gfky1356-ship-it/sgx-data-download.git && pip install yfinance requests -q
+#   !git clone -q https://YOUR_TOKEN@github.com/gfky1356-ship-it/sgx-data-download.git \
+#     && pip install yfinance requests weasyprint pypdf -q
 #   !python sgx-data-download/stock_scanner_colab.py
 #
 # Public repo (no token needed):
-#   !wget -qO stock_scanner_colab.py https://raw.githubusercontent.com/gfky1356-ship-it/sgx-data-download/main/stock_scanner_colab.py && pip install yfinance requests -q
+#   !wget -qO stock_scanner_colab.py https://raw.githubusercontent.com/gfky1356-ship-it/sgx-data-download/main/stock_scanner_colab.py \
+#     && pip install yfinance requests weasyprint pypdf -q
 #   !python stock_scanner_colab.py
 # ─────────────────────────────────────────────────────────────
 #
@@ -25,15 +27,24 @@
 #
 # Price used in FA report = last close from downloaded data.
 #
-# Outputs:
-#   /content/sgx_scan_results.csv
-#   /content/sgx_watchlist.txt
-#   /content/us_scan_results.csv
-#   /content/us_watchlist.txt
-#   /content/fa_reports/<TICKER>_FA_v5.9_<date>.html
+# NEW in v7.0:
+#   - Google Drive auto-mount; ALL outputs saved to Drive
+#   - FA HTML reports combined into one PDF (weasyprint + pypdf)
+#   - SPY (US) and ^STI (SG) benchmark data saved as CSV
+#   - 14-period RSI computed per stock vs its market benchmark
+#   - RSI ratio (stock RSI14 / index RSI14) in results + watchlist report
+#   - data_adapter.py + screener_module.py for modular future use
+#
+# Outputs (all saved to Google Drive → MyDrive/StockScanner/):
+#   sgx_scan_results.csv          us_scan_results.csv
+#   sgx_watchlist.txt             us_watchlist.txt
+#   sgx_rsi_comparison.csv        us_rsi_comparison.csv
+#   benchmark_data/STI.csv        benchmark_data/SPY.csv
+#   fa_reports/<TICKER>_FA_v6.0_<date>.html
+#   fa_reports/ALL_FA_REPORTS_<date>.pdf
 # ============================================================
 
-# !pip install yfinance requests -q
+# !pip install yfinance requests weasyprint pypdf -q
 
 import csv, os, re, time, warnings, webbrowser
 import numpy as np
@@ -44,21 +55,42 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore")
 
+# ── Google Drive (auto-mount in Colab, fallback to /content) ─
+try:
+    from google.colab import drive
+    drive.mount("/content/drive", force_remount=False)
+    GDRIVE_BASE = "/content/drive/MyDrive/StockScanner"
+    print(f"✅ Google Drive mounted → {GDRIVE_BASE}")
+except Exception:
+    GDRIVE_BASE = "/content"
+    print("ℹ️  Google Drive not available — saving to /content")
+
+os.makedirs(GDRIVE_BASE, exist_ok=True)
+BENCHMARK_DATA_DIR = os.path.join(GDRIVE_BASE, "benchmark_data")
+os.makedirs(BENCHMARK_DATA_DIR, exist_ok=True)
+
 # ── SGX output paths ────────────────────────────────────────
-SGX_OUTPUT_RESULTS   = "/content/sgx_scan_results.csv"
-SGX_OUTPUT_WATCHLIST = "/content/sgx_watchlist.txt"
+SGX_OUTPUT_RESULTS   = os.path.join(GDRIVE_BASE, "sgx_scan_results.csv")
+SGX_OUTPUT_WATCHLIST = os.path.join(GDRIVE_BASE, "sgx_watchlist.txt")
+SGX_RSI_COMPARISON   = os.path.join(GDRIVE_BASE, "sgx_rsi_comparison.csv")
 
 # ── US output paths ─────────────────────────────────────────
-US_OUTPUT_RESULTS    = "/content/us_scan_results.csv"
-US_OUTPUT_WATCHLIST  = "/content/us_watchlist.txt"
+US_OUTPUT_RESULTS    = os.path.join(GDRIVE_BASE, "us_scan_results.csv")
+US_OUTPUT_WATCHLIST  = os.path.join(GDRIVE_BASE, "us_watchlist.txt")
+US_RSI_COMPARISON    = os.path.join(GDRIVE_BASE, "us_rsi_comparison.csv")
 
-FA_REPORTS_DIR       = "/content/fa_reports"
+FA_REPORTS_DIR       = os.path.join(GDRIVE_BASE, "fa_reports")
+COMBINED_FA_PDF      = os.path.join(
+    FA_REPORTS_DIR, f"ALL_FA_REPORTS_{datetime.now().strftime('%Y%m%d')}.pdf"
+)
 
 # ── Benchmarks ──────────────────────────────────────────────
-SGX_BENCHMARK = "^STI"
-US_BENCHMARK  = "^GSPC"
+# US benchmark: SPY (S&P 500 ETF, matches TradingView SPY ticker)
+# SG benchmark: ^STI (Straits Times Index, matches TradingView TVC:STI)
+SGX_BENCHMARK        = "^STI"
+US_BENCHMARK         = "SPY"
 
-BATCH_SIZE    = 50
+BATCH_SIZE           = 50
 
 # ── Filters ─────────────────────────────────────────────────
 SGX_MIN_VOLUME = 100_000
@@ -84,9 +116,9 @@ class GlobalScreenerV59_CN:
     """GLOBAL Screener v6.0 — HTML 报告"""
 
     def __init__(self, ticker, price, data):
-        self.ticker = str(ticker).upper()
-        self.price  = float(price)
-        self.data   = data
+        self.ticker  = str(ticker).upper()
+        self.price   = float(price)
+        self.data    = data
         self.version     = SCREENER_VERSION
         self.report_date = datetime.now().strftime("%Y年%m月%d日")
         self.is_sg = (
@@ -352,6 +384,17 @@ def _sma(series, length):
     return series.rolling(length, min_periods=length).mean()
 
 
+def calc_rsi(series, period=14):
+    """Wilder's smoothed RSI."""
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
 def add_sma_gap_rs_buy_sell_signals(df, index_close,
     b_sma20_len=20, b_sma50_len=50, b_slope_lookback=5,
     b_slope_smooth_len=1, a_rs_sma_length=30, a_delta_ma_length=9):
@@ -471,11 +514,62 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
 
 
 # ════════════════════════════════════════════════════════════
+# BENCHMARK HELPERS
+# ════════════════════════════════════════════════════════════
+def save_benchmark_to_csv(close_series, name, directory):
+    """Save benchmark close series to CSV in the benchmark data directory."""
+    safe_name = name.replace("^", "")
+    path = os.path.join(directory, f"{safe_name}.csv")
+    close_series.to_frame(name="close").to_csv(path)
+    print(f"    Benchmark saved → {path}")
+    return path
+
+
+def combine_fa_reports_to_pdf(html_paths, output_path):
+    """Convert individual FA HTML reports to PDF and merge into one file."""
+    if not html_paths:
+        return None
+    try:
+        from weasyprint import HTML as WeasyprintHTML
+        import pypdf
+    except ImportError:
+        print("    ⚠️  PDF combine skipped — run: !pip install weasyprint pypdf -q")
+        return None
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    tmp_pdfs = []
+    for hp in html_paths:
+        pp = hp.replace(".html", "_tmp.pdf")
+        try:
+            WeasyprintHTML(filename=hp).write_pdf(pp)
+            tmp_pdfs.append(pp)
+        except Exception as e:
+            print(f"    ⚠️  PDF convert failed for {os.path.basename(hp)}: {e}")
+
+    if not tmp_pdfs:
+        return None
+
+    try:
+        merger = pypdf.PdfMerger()
+        for pp in tmp_pdfs:
+            merger.append(pp)
+        merger.write(output_path)
+        merger.close()
+        print(f"    ✅ Combined FA PDF ({len(tmp_pdfs)} reports) → {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"    ❌ PDF merge failed: {e}")
+        return None
+    finally:
+        for pp in tmp_pdfs:
+            try: os.remove(pp)
+            except: pass
+
+
+# ════════════════════════════════════════════════════════════
 # SHARED FA HELPER
 # Price comes from downloaded batch data (last_close),
 # NOT from a live Yahoo Finance quote fetch.
-# Fundamentals (ROE, margins, PE, etc.) are fetched from
-# Yahoo Finance, with SGX API as fallback for PE.
 # ════════════════════════════════════════════════════════════
 def _sgx_float(sgx_info, key):
     v = sgx_info.get(key)
@@ -487,10 +581,6 @@ def _sgx_float(sgx_info, key):
 
 
 def _fetch_fa_data(yf_ticker, fallback_name, sgx_info=None):
-    """
-    Fetch FA fundamentals. Price is NOT fetched here —
-    the caller passes last_close from the downloaded data.
-    """
     sgx_info = sgx_info or {}
     try:
         yf_info = yf.Ticker(yf_ticker).info
@@ -544,23 +634,22 @@ def _fetch_fa_data(yf_ticker, fallback_name, sgx_info=None):
 
 
 def run_fa_scan(matched, ticker_info, market_label):
-    """Run FA scan for a list of confirmed signals. Price taken from last_close in matched list."""
+    """Run FA scan for confirmed signals. Returns list of saved HTML report paths."""
     if not matched:
         print(f"    No confirmed signals — FA scan skipped.")
-        return
+        return []
     os.makedirs(FA_REPORTS_DIR, exist_ok=True)
-    fa_reports = []
+    fa_reports  = []
     fa_failures = []
     for r in matched:
         yf_t     = r["yf_ticker"]
         sgx_info = ticker_info.get(yf_t, {})
         print(f"    FA → {r['symbol']:<8} {r['name'][:32]:<32}", end=" ", flush=True)
         try:
-            fa_data    = _fetch_fa_data(yf_t, r["name"], sgx_info)
-            pe_src     = fa_data.pop("_pe_source", "?")
-            # Price comes from batch-downloaded data (last_close), not live fetch
-            screener   = GlobalScreenerV59_CN(r["symbol"], r["last_close"], fa_data)
-            path       = screener.save_report(output_dir=FA_REPORTS_DIR)
+            fa_data  = _fetch_fa_data(yf_t, r["name"], sgx_info)
+            pe_src   = fa_data.pop("_pe_source", "?")
+            screener = GlobalScreenerV59_CN(r["symbol"], r["last_close"], fa_data)
+            path     = screener.save_report(output_dir=FA_REPORTS_DIR)
             fa_reports.append(path)
             _, verdict_label, _ = screener.get_verdict()
             print(f"✅  {verdict_label}  [PE:{pe_src}  Price:{r['last_close']}]")
@@ -571,6 +660,7 @@ def run_fa_scan(matched, ticker_info, market_label):
     print(f"\n    {market_label} FA reports : {len(fa_reports)} saved to {FA_REPORTS_DIR}/")
     if fa_failures:
         print(f"    Failed : {', '.join(fa_failures)}")
+    return fa_reports
 
 
 # ════════════════════════════════════════════════════════════
@@ -602,14 +692,17 @@ sgx_ticker_info = {
 }
 print(f"    Found {len(sgx_ticker_info)} stocks")
 
-# ── SGX Step 2: Download price data ─────────────────────────
+# ── SGX Step 2: Download benchmark + price data ──────────────
 end_date   = datetime.today().strftime("%Y-%m-%d")
 start_date = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 print(f"\n[SGX 2/5] Downloading data ({start_date} → {end_date})...")
-print(f"    Benchmark: {SGX_BENCHMARK}")
+print(f"    Benchmark: {SGX_BENCHMARK}  (TradingView: TVC:STI)")
 
 sti_raw   = yf.download(SGX_BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
 sti_close = sti_raw["Close"].squeeze()
+sti_rsi14 = calc_rsi(sti_close)  # pre-compute benchmark RSI14
+save_benchmark_to_csv(sti_close, "STI", BENCHMARK_DATA_DIR)
+print(f"    TVC:STI RSI14 (latest): {float(sti_rsi14.iloc[-1]):.2f}")
 
 all_sgx  = list(sgx_ticker_info.keys())
 batches  = [all_sgx[i:i+BATCH_SIZE] for i in range(0, len(all_sgx), BATCH_SIZE)]
@@ -643,6 +736,8 @@ print(f"    Before: {len(sgx_data)}  →  After: {len(sgx_filtered)}  ({len(sgx_
 print(f"\n[SGX 3/5] Running scanners on {len(sgx_filtered)} stocks...")
 sgx_results = []
 min_bars    = 110
+idx_rsi_sgx = float(sti_rsi14.iloc[-1]) if pd.notna(sti_rsi14.iloc[-1]) else None
+
 for idx, (yf_t, df) in enumerate(sgx_filtered.items()):
     if len(df) < min_bars: continue
     info = sgx_ticker_info[yf_t]
@@ -654,6 +749,13 @@ for idx, (yf_t, df) in enumerate(sgx_filtered.items()):
         bo_sig       = bool(df_bo["any_buy_signal"].iloc[-1])
         obv_sell_ban = bool(df_obv["sell_ban"].iloc[-1])
         confirmed    = (sma_sig and obv_sell_ban) or (bo_sig and obv_sell_ban)
+
+        # RSI14 vs benchmark
+        stock_rsi_s  = calc_rsi(df["close"])
+        stock_rsi14  = round(float(stock_rsi_s.iloc[-1]), 2) if pd.notna(stock_rsi_s.iloc[-1]) else None
+        rsi_ratio    = (round(stock_rsi14 / idx_rsi_sgx, 4)
+                        if stock_rsi14 and idx_rsi_sgx and idx_rsi_sgx > 0 else None)
+
         sgx_results.append({
             "symbol": info["symbol"], "name": info["name"], "market": info["market"],
             "yf_ticker": yf_t,
@@ -661,6 +763,9 @@ for idx, (yf_t, df) in enumerate(sgx_filtered.items()):
             "breakout_buy": bo_sig, "obv_sell_ban": obv_sell_ban,
             "last_close": round(float(df["close"].iloc[-1]), 4),
             "last_date":  df.index[-1].strftime("%Y-%m-%d"), "bars": len(df),
+            "rsi14":       stock_rsi14,
+            "index_rsi14": round(idx_rsi_sgx, 2) if idx_rsi_sgx else None,
+            "rsi_ratio":   rsi_ratio,
         })
     except Exception: pass
     if (idx+1) % 50 == 0:
@@ -671,27 +776,53 @@ print(f"\n    Done: {len(sgx_results)} scanned, {len(sgx_matched)} confirmed sig
 
 # ── SGX Step 4: Export ───────────────────────────────────────
 print(f"\n[SGX 4/5] Exporting results...")
-fieldnames = ["symbol","name","market","signal_confirmed","sma_gap_buy","breakout_buy","obv_sell_ban","last_close","last_date","bars"]
+fieldnames = [
+    "symbol","name","market","signal_confirmed","sma_gap_buy","breakout_buy",
+    "obv_sell_ban","last_close","last_date","bars","rsi14","index_rsi14","rsi_ratio"
+]
 with open(SGX_OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=fieldnames)
     w.writeheader()
-    w.writerows(sorted([{k:r[k] for k in fieldnames} for r in sgx_results], key=lambda r: r["signal_confirmed"], reverse=True))
+    w.writerows(sorted([{k:r[k] for k in fieldnames} for r in sgx_results],
+                       key=lambda r: r["signal_confirmed"], reverse=True))
 print(f"    Full results → {SGX_OUTPUT_RESULTS}")
 
 with open(SGX_OUTPUT_WATCHLIST, "w", encoding="utf-8") as f:
     for r in sgx_matched: f.write(f"SGX:{r['symbol']}\n")
 print(f"    TV watchlist → {SGX_OUTPUT_WATCHLIST}  ({len(sgx_matched)} tickers)")
 
+# RSI comparison report for confirmed signals (companion to TV watchlist)
+rsi_fields = ["tv_ticker","symbol","name","rsi14","index_rsi14","rsi_ratio","index_ticker","last_date"]
+with open(SGX_RSI_COMPARISON, "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=rsi_fields)
+    w.writeheader()
+    for r in sgx_matched:
+        w.writerow({
+            "tv_ticker":    f"SGX:{r['symbol']}",
+            "symbol":       r["symbol"],
+            "name":         r["name"],
+            "rsi14":        r["rsi14"],
+            "index_rsi14":  r["index_rsi14"],
+            "rsi_ratio":    r["rsi_ratio"],
+            "index_ticker": "TVC:STI",
+            "last_date":    r["last_date"],
+        })
+print(f"    RSI comparison → {SGX_RSI_COMPARISON}")
+
 print("\n" + "=" * 60)
 print(f"  SGX CONFIRMED SIGNALS ({len(sgx_matched)} stocks)")
 print("=" * 60)
 if sgx_matched:
-    print(f"  {'Symbol':<8} {'Name':<30} {'Close':>8} {'SMA':^5} {'BO':^5} {'OBV':^5}")
+    print(f"  {'Symbol':<8} {'Name':<28} {'Close':>7} {'SMA':^4} {'BO':^4} {'OBV':^4} {'RSI14':>6} {'IdxRSI':>7} {'Ratio':>6}")
+    print(f"  {'-'*8} {'-'*28} {'-'*7} {'-'*4} {'-'*4} {'-'*4} {'-'*6} {'-'*7} {'-'*6}")
     for r in sgx_matched:
-        print(f"  {r['symbol']:<8} {r['name'][:30]:<30} S${r['last_close']:>6.3f} "
-              f"{'Y' if r['sma_gap_buy'] else 'N':^5} "
-              f"{'Y' if r['breakout_buy'] else 'N':^5} "
-              f"{'Y' if r['obv_sell_ban'] else 'N':^5}")
+        rsi_str   = f"{r['rsi14']:.1f}" if r['rsi14']   else "  N/A"
+        ratio_str = f"{r['rsi_ratio']:.3f}" if r['rsi_ratio'] else "  N/A"
+        print(f"  {r['symbol']:<8} {r['name'][:28]:<28} S${r['last_close']:>5.3f} "
+              f"{'Y' if r['sma_gap_buy'] else 'N':^4} "
+              f"{'Y' if r['breakout_buy'] else 'N':^4} "
+              f"{'Y' if r['obv_sell_ban'] else 'N':^4} "
+              f"{rsi_str:>6} {r['index_rsi14'] or 'N/A':>7} {ratio_str:>6}")
 else:
     print("  No confirmed signals today.")
 print("=" * 60)
@@ -699,7 +830,7 @@ print("=" * 60)
 # ── SGX Step 5: FA scan ──────────────────────────────────────
 print(f"\n[SGX 5/5] FA scan on {len(sgx_matched)} confirmed SGX stocks...")
 print("    Note: price = last_close from downloaded batch data")
-run_fa_scan(sgx_matched, sgx_ticker_info, "SGX")
+sgx_fa_reports = run_fa_scan(sgx_matched, sgx_ticker_info, "SGX")
 
 
 # ════════════════════════════════════════════════════════════
@@ -722,23 +853,26 @@ try:
     sp500_df = pd.read_html(wiki_resp.text)[0]
     us_ticker_info = {}
     for _, row in sp500_df.iterrows():
-        raw_sym = str(row["Symbol"]).replace(".", "-")   # BRK.B → BRK-B for Yahoo Finance
+        raw_sym = str(row["Symbol"]).replace(".", "-")
         us_ticker_info[raw_sym] = {
-            "symbol":  raw_sym,
-            "name":    str(row.get("Security", raw_sym)),
-            "sector":  str(row.get("GICS Sector", "")),
+            "symbol": raw_sym,
+            "name":   str(row.get("Security", raw_sym)),
+            "sector": str(row.get("GICS Sector", "")),
         }
     print(f"    Found {len(us_ticker_info)} stocks")
 except Exception as e:
     print(f"    ERROR fetching S&P 500 list: {e}")
     us_ticker_info = {}
 
-# ── US Step 2: Download price data ──────────────────────────
+# ── US Step 2: Download benchmark + price data ───────────────
 print(f"\n[US 2/5] Downloading data ({start_date} → {end_date})...")
-print(f"    Benchmark: {US_BENCHMARK}")
+print(f"    Benchmark: {US_BENCHMARK}  (TradingView: SPY)")
 
-gspc_raw   = yf.download(US_BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
-gspc_close = gspc_raw["Close"].squeeze()
+spy_raw   = yf.download(US_BENCHMARK, start=start_date, end=end_date, auto_adjust=True, progress=False)
+spy_close = spy_raw["Close"].squeeze()
+spy_rsi14 = calc_rsi(spy_close)  # pre-compute benchmark RSI14
+save_benchmark_to_csv(spy_close, "SPY", BENCHMARK_DATA_DIR)
+print(f"    SPY RSI14 (latest): {float(spy_rsi14.iloc[-1]):.2f}")
 
 all_us  = list(us_ticker_info.keys())
 batches = [all_us[i:i+BATCH_SIZE] for i in range(0, len(all_us), BATCH_SIZE)]
@@ -770,18 +904,27 @@ print(f"    Before: {len(us_data)}  →  After: {len(us_filtered)}  ({len(us_dat
 
 # ── US Step 3: Run scanners ──────────────────────────────────
 print(f"\n[US 3/5] Running scanners on {len(us_filtered)} stocks...")
-us_results = []
+us_results  = []
+idx_rsi_us  = float(spy_rsi14.iloc[-1]) if pd.notna(spy_rsi14.iloc[-1]) else None
+
 for idx, (sym, df) in enumerate(us_filtered.items()):
     if len(df) < min_bars: continue
     info = us_ticker_info[sym]
     try:
-        df_sma = add_sma_gap_rs_buy_sell_signals(df, gspc_close)
+        df_sma = add_sma_gap_rs_buy_sell_signals(df, spy_close)
         df_bo  = add_breakout_buy_signals(df)
         df_obv = add_obv_signals(df)
         sma_sig      = bool(df_sma["buy_signal"].iloc[-1])
         bo_sig       = bool(df_bo["any_buy_signal"].iloc[-1])
         obv_sell_ban = bool(df_obv["sell_ban"].iloc[-1])
         confirmed    = (sma_sig and obv_sell_ban) or (bo_sig and obv_sell_ban)
+
+        # RSI14 vs benchmark
+        stock_rsi_s = calc_rsi(df["close"])
+        stock_rsi14 = round(float(stock_rsi_s.iloc[-1]), 2) if pd.notna(stock_rsi_s.iloc[-1]) else None
+        rsi_ratio   = (round(stock_rsi14 / idx_rsi_us, 4)
+                       if stock_rsi14 and idx_rsi_us and idx_rsi_us > 0 else None)
+
         us_results.append({
             "symbol": info["symbol"], "name": info["name"], "market": "US",
             "yf_ticker": sym,
@@ -789,6 +932,9 @@ for idx, (sym, df) in enumerate(us_filtered.items()):
             "breakout_buy": bo_sig, "obv_sell_ban": obv_sell_ban,
             "last_close": round(float(df["close"].iloc[-1]), 4),
             "last_date":  df.index[-1].strftime("%Y-%m-%d"), "bars": len(df),
+            "rsi14":       stock_rsi14,
+            "index_rsi14": round(idx_rsi_us, 2) if idx_rsi_us else None,
+            "rsi_ratio":   rsi_ratio,
         })
     except Exception: pass
     if (idx+1) % 50 == 0:
@@ -802,23 +948,44 @@ print(f"\n[US 4/5] Exporting results...")
 with open(US_OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=fieldnames)
     w.writeheader()
-    w.writerows(sorted([{k:r[k] for k in fieldnames} for r in us_results], key=lambda r: r["signal_confirmed"], reverse=True))
+    w.writerows(sorted([{k:r[k] for k in fieldnames} for r in us_results],
+                       key=lambda r: r["signal_confirmed"], reverse=True))
 print(f"    Full results → {US_OUTPUT_RESULTS}")
 
 with open(US_OUTPUT_WATCHLIST, "w", encoding="utf-8") as f:
     for r in us_matched: f.write(f"NYSE:{r['symbol']}\n")
 print(f"    TV watchlist → {US_OUTPUT_WATCHLIST}  ({len(us_matched)} tickers)")
 
+with open(US_RSI_COMPARISON, "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=rsi_fields)
+    w.writeheader()
+    for r in us_matched:
+        w.writerow({
+            "tv_ticker":    f"NYSE:{r['symbol']}",
+            "symbol":       r["symbol"],
+            "name":         r["name"],
+            "rsi14":        r["rsi14"],
+            "index_rsi14":  r["index_rsi14"],
+            "rsi_ratio":    r["rsi_ratio"],
+            "index_ticker": "SPY",
+            "last_date":    r["last_date"],
+        })
+print(f"    RSI comparison → {US_RSI_COMPARISON}")
+
 print("\n" + "=" * 60)
 print(f"  US CONFIRMED SIGNALS ({len(us_matched)} stocks)")
 print("=" * 60)
 if us_matched:
-    print(f"  {'Symbol':<8} {'Name':<30} {'Close':>8} {'SMA':^5} {'BO':^5} {'OBV':^5}")
+    print(f"  {'Symbol':<8} {'Name':<28} {'Close':>8} {'SMA':^4} {'BO':^4} {'OBV':^4} {'RSI14':>6} {'IdxRSI':>7} {'Ratio':>6}")
+    print(f"  {'-'*8} {'-'*28} {'-'*8} {'-'*4} {'-'*4} {'-'*4} {'-'*6} {'-'*7} {'-'*6}")
     for r in us_matched:
-        print(f"  {r['symbol']:<8} {r['name'][:30]:<30} US${r['last_close']:>7.2f} "
-              f"{'Y' if r['sma_gap_buy'] else 'N':^5} "
-              f"{'Y' if r['breakout_buy'] else 'N':^5} "
-              f"{'Y' if r['obv_sell_ban'] else 'N':^5}")
+        rsi_str   = f"{r['rsi14']:.1f}" if r['rsi14']   else "  N/A"
+        ratio_str = f"{r['rsi_ratio']:.3f}" if r['rsi_ratio'] else "  N/A"
+        print(f"  {r['symbol']:<8} {r['name'][:28]:<28} US${r['last_close']:>6.2f} "
+              f"{'Y' if r['sma_gap_buy'] else 'N':^4} "
+              f"{'Y' if r['breakout_buy'] else 'N':^4} "
+              f"{'Y' if r['obv_sell_ban'] else 'N':^4} "
+              f"{rsi_str:>6} {r['index_rsi14'] or 'N/A':>7} {ratio_str:>6}")
 else:
     print("  No confirmed signals today.")
 print("=" * 60)
@@ -826,7 +993,18 @@ print("=" * 60)
 # ── US Step 5: FA scan ───────────────────────────────────────
 print(f"\n[US 5/5] FA scan on {len(us_matched)} confirmed US stocks...")
 print("    Note: price = last_close from downloaded batch data")
-run_fa_scan(us_matched, us_ticker_info, "US")
+us_fa_reports = run_fa_scan(us_matched, us_ticker_info, "US")
+
+
+# ════════════════════════════════════════════════════════════
+# COMBINE FA REPORTS INTO ONE PDF
+# ════════════════════════════════════════════════════════════
+all_fa_reports = sgx_fa_reports + us_fa_reports
+if all_fa_reports:
+    print(f"\n[PDF] Combining {len(all_fa_reports)} FA reports into single PDF...")
+    combine_fa_reports_to_pdf(all_fa_reports, COMBINED_FA_PDF)
+else:
+    print("\n[PDF] No FA reports to combine.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -835,11 +1013,20 @@ run_fa_scan(us_matched, us_ticker_info, "US")
 print("\n\n" + "=" * 60)
 print("  ALL DONE")
 print("=" * 60)
-print(f"  SGX results  : {SGX_OUTPUT_RESULTS}")
-print(f"  SGX watchlist: {SGX_OUTPUT_WATCHLIST}  ({len(sgx_matched)} signals)")
-print(f"  US  results  : {US_OUTPUT_RESULTS}")
-print(f"  US  watchlist: {US_OUTPUT_WATCHLIST}  ({len(us_matched)} signals)")
-print(f"  FA  reports  : {FA_REPORTS_DIR}/  ({len(sgx_matched)+len(us_matched)} total)")
+print(f"  All files saved to: {GDRIVE_BASE}/")
+print()
+print(f"  SGX results      : {SGX_OUTPUT_RESULTS}")
+print(f"  SGX watchlist    : {SGX_OUTPUT_WATCHLIST}  ({len(sgx_matched)} signals)")
+print(f"  SGX RSI report   : {SGX_RSI_COMPARISON}  (TVC:STI benchmark)")
+print(f"  US  results      : {US_OUTPUT_RESULTS}")
+print(f"  US  watchlist    : {US_OUTPUT_WATCHLIST}  ({len(us_matched)} signals)")
+print(f"  US  RSI report   : {US_RSI_COMPARISON}  (SPY benchmark)")
+print(f"  Benchmarks       : {BENCHMARK_DATA_DIR}/STI.csv  |  SPY.csv")
+print(f"  FA  reports (HTML): {FA_REPORTS_DIR}/  ({len(all_fa_reports)} total)")
+print(f"  FA  combined PDF : {COMBINED_FA_PDF}")
 print("=" * 60)
 print("\nImport into TradingView:")
 print("  Watchlist → ⋮ → Import watchlist → sgx_watchlist.txt / us_watchlist.txt")
+print("\nRSI ratio columns: stock RSI14 / index RSI14")
+print("  ratio > 1.0 → stock is relatively stronger than the index")
+print("  ratio < 1.0 → stock is relatively weaker  than the index")
