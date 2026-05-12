@@ -516,6 +516,22 @@ def add_obv_signals(df, short_sma_length=20, long_sma_length=100, confirm_days=1
 # ════════════════════════════════════════════════════════════
 # BENCHMARK HELPERS
 # ════════════════════════════════════════════════════════════
+_TV_EXCHANGE_MAP = {
+    "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ",
+    "NasdaqGS": "NASDAQ", "NasdaqGM": "NASDAQ", "NasdaqCM": "NASDAQ",
+    "NYQ": "NYSE", "PCX": "NYSE", "NYSEArca": "NYSE", "ASE": "NYSE",
+}
+
+def get_tv_ticker(symbol):
+    """Return 'NASDAQ:SYMBOL' or 'NYSE:SYMBOL'; falls back to plain symbol on error."""
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        ex = fi.exchange if hasattr(fi, "exchange") else ""
+        tv_ex = _TV_EXCHANGE_MAP.get(ex, "")
+        return f"{tv_ex}:{symbol}" if tv_ex else symbol
+    except Exception:
+        return symbol
+
 def save_benchmark_to_csv(close_series, name, directory):
     """Save benchmark close series to CSV in the benchmark data directory."""
     safe_name = name.replace("^", "")
@@ -945,6 +961,10 @@ print(f"\n    Done: {len(us_results)} scanned, {len(us_matched)} confirmed signa
 
 # ── US Step 4: Export ────────────────────────────────────────
 print(f"\n[US 4/5] Exporting results...")
+# Resolve correct TradingView exchange prefix (NASDAQ: vs NYSE:) for each confirmed stock
+print(f"    Resolving TradingView exchange prefixes for {len(us_matched)} confirmed stocks...")
+for r in us_matched:
+    r["tv_ticker"] = get_tv_ticker(r["symbol"])
 with open(US_OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=fieldnames)
     w.writeheader()
@@ -953,7 +973,7 @@ with open(US_OUTPUT_RESULTS, "w", newline="", encoding="utf-8") as f:
 print(f"    Full results → {US_OUTPUT_RESULTS}")
 
 with open(US_OUTPUT_WATCHLIST, "w", encoding="utf-8") as f:
-    for r in us_matched: f.write(f"NYSE:{r['symbol']}\n")
+    for r in us_matched: f.write(f"{r['tv_ticker']}\n")
 print(f"    TV watchlist → {US_OUTPUT_WATCHLIST}  ({len(us_matched)} tickers)")
 
 with open(US_RSI_COMPARISON, "w", newline="", encoding="utf-8") as f:
@@ -961,7 +981,7 @@ with open(US_RSI_COMPARISON, "w", newline="", encoding="utf-8") as f:
     w.writeheader()
     for r in us_matched:
         w.writerow({
-            "tv_ticker":    f"NYSE:{r['symbol']}",
+            "tv_ticker":    r["tv_ticker"],
             "symbol":       r["symbol"],
             "name":         r["name"],
             "rsi14":        r["rsi14"],
