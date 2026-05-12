@@ -55,15 +55,24 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore")
 
-# ── Google Drive (auto-mount in Colab, fallback to /content) ─
-try:
-    from google.colab import drive
-    drive.mount("/content/drive", force_remount=False)
+# ── Google Drive ─────────────────────────────────────────────
+# Drive must be mounted in a separate Colab cell BEFORE running
+# this script (drive.mount() cannot run inside a subprocess).
+# If already mounted, we just detect the path automatically.
+if os.path.isdir("/content/drive/MyDrive"):
     GDRIVE_BASE = "/content/drive/MyDrive/StockScanner"
-    print(f"✅ Google Drive mounted → {GDRIVE_BASE}")
-except Exception:
-    GDRIVE_BASE = "/content"
-    print("ℹ️  Google Drive not available — saving to /content")
+    print(f"✅ Google Drive detected → {GDRIVE_BASE}")
+else:
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive", force_remount=False)
+        GDRIVE_BASE = "/content/drive/MyDrive/StockScanner"
+        print(f"✅ Google Drive mounted → {GDRIVE_BASE}")
+    except Exception:
+        GDRIVE_BASE = "/content"
+        print("⚠️  Google Drive not mounted — saving to /content instead.\n"
+              "    To save to Drive: run  from google.colab import drive; drive.mount('/content/drive')\n"
+              "    in a separate cell first, then re-run this script.")
 
 os.makedirs(GDRIVE_BASE, exist_ok=True)
 BENCHMARK_DATA_DIR = os.path.join(GDRIVE_BASE, "benchmark_data")
