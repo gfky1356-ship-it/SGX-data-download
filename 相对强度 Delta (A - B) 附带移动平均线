@@ -1,0 +1,47 @@
+//@version=5
+indicator("相对强度 Delta (A - B) 附带移动平均线", overlay=false)
+
+// --- 0. 用户自定义输入参数 ---
+// 基础计算的 SMA 周期
+smaLength = input.int(30, title="基础 SMA 计算周期 (天数)", minval=1, step=1)
+// 新增：Delta 柱状图的移动平均线周期（默认 9 天，可调）
+deltaMaLength = input.int(9, title="Delta 移动平均线周期", minval=1, step=1) 
+
+// --- 1. 市场识别与指数选择 ---
+isSG = syminfo.currency == "SGD" or syminfo.prefix == "SGX"
+// 新加坡股使用 TVC:STI（海峡时报指数），美股或其他默认使用 SPY
+indexSymbol = isSG ? "TVC:STI" : "SPY"
+
+// --- 2. 个股数据计算 (A) ---
+stockSma = ta.sma(close, smaLength)
+// A: 当前K线收盘价 / 个股 SMA
+resultA = close / stockSma
+
+// --- 3. 指数数据计算 (B) ---
+[indexClose, indexSma] = request.security(indexSymbol, timeframe.period, [close, ta.sma(close, smaLength)])
+// B: 指数当前收盘价 / 指数 SMA
+resultB = indexClose / indexSma
+
+// --- 4. 计算差值 (Delta) 与 平滑线 (MA) ---
+// 计算 A 和 B 的差值
+deltaAB = resultA - resultB
+// 新增：计算 Delta 差值的简单移动平均线 (SMA)
+deltaMa = ta.sma(deltaAB, deltaMaLength) 
+
+// --- 5. 视觉渲染 ---
+// 柱状图颜色设置
+deltaColor = deltaAB >= 0 ? color.new(color.green, 20) : color.new(color.red, 20)
+
+// 绘制 Delta 柱状图
+plot(deltaAB, title="A-B Delta 柱状图", style=plot.style_columns, color=deltaColor)
+
+// 新增：绘制 Delta 的移动平均线 (使用亮橙色，线宽设为2以突出显示)
+plot(deltaMa, title="Delta 移动平均线 (MA)", color=color.orange, linewidth=2)
+
+// 绘制 0 轴基准线
+hline(0, title="零轴 (0)", color=color.gray, linestyle=hline.style_dashed)
+
+// --- 6. 右上角指示牌 ---
+var table benchmarkTable = table.new(position.top_right, 1, 1, bgcolor = color.new(color.black, 70), frame_color = color.gray, frame_width = 1)
+if barstate.islast
+    table.cell(benchmarkTable, 0, 0, text="当前基准: " + indexSymbol, text_color=color.white, text_size=size.normal)
